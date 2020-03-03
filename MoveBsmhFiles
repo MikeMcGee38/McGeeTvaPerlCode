@@ -1,0 +1,399 @@
+#!/usr/bin/perl
+#============================================================================
+#
+# File: /apps/rfc/system/bin/MoveBsmhFiles
+#
+# Purpose: This script should be run every 10 minutes from ldm's crontab.
+#          To coordinate transferring the same files to two servers, this
+#          script should be run on the 5 minute mark (5, 15, 25, ...).
+#          The script on rvsprod to transfer the same files will run at
+#          the zero mark (0, 10, 20, ....).  This way both servers can
+#          retrieve the same files before either deletes them.
+#
+# Inputs:  Files on the TVA sftp server that are copied there by Brookfield
+#            Smokey Mountain Hydro (BSMH).
+#          Temporary files in the data directory that indicate if the
+#            current files have already been transferred to the FS server.
+#          The sftp commands file that is dynamically created to hold
+#            commands to operate on files on the sftp server.
+#
+# Outputs: Renamed BSMH files copied to the appropriate FS server.
+#
+# Developer: Mike McGee
+#
+# Updates:
+#  1.0  09/17/2014  mpm  original code
+#  2.0  05/26/2015  mpm  For the files sent to FEWS, change the format
+#                          of the filenames.
+#  2.1  08/12/2015  mpm  use encryption routines to determine samba login info
+#  3.0  02/17/2016  mpm  switch to sftp to transfer files to FS1
+#  3.1  03/15/2016  mpm  Handle BSMH hourly files for their 4 dams
+#  3.2  04/14/2016  mpm  execute FEWS workflow after transferring files
+#  3.3  05/03/2016  mpm  read database name from DetermineEnvironment app.
+#  3.3  06/14/2016  mpm  execute python script to run FEWS workflow
+#  4.0  11/01/2016  mpm  archive BSMH files to /apps/rfc/system/data
+#  5.0  02/16/2017  mpm  change how the different file types are handled.
+#  6.0  03/08/2017  mpm  convert from sftp to smbclient for file xfers
+#                          to FEWS.
+#
+#============================================================================
+
+use lib '/apps/rfc/system/lib';
+
+# Specify perl modules to load.
+use TvaGeneralRoutines;
+use UserIdsWithEncryption;
+use File::Basename;
+use File::Path;
+use Date::Calc qw(:all);
+
+use strict;
+
+# Determine the process ID of the script.
+my $PROCESSID = $$;
+
+# Determine and set the name of the script
+my $SCRIPTNAME = basename( $0 );
+
+# Determine operating environment.
+my $TempString = `/apps/rfc/system/bin/DetermineEnvironment`;
+my ( $SERVERTYPE, $FORECASTSHELLSERVER, $DBNAME ) = split /,/, $TempString;
+
+# Define the smbclient variables. The samba service name for
+# the FEWS FS1 server. All environments are the same except DEV.
+my $SMBUSERID;
+my $SMBUSERPASSWD;
+my $SMBWORKGROUP;
+GetKeyInfo( "FS1_$SERVERTYPE", \$SMBUSERID, \$SMBUSERPASSWD, \$SMBWORKGROUP );
+my $FEWSSERVICENAME = "$FORECASTSHELLSERVER/Fews";
+if ( $SERVERTYPE =~ "DEV" ) {
+  $FEWSSERVICENAME .= "_DEV";
+} # end if
+my $SMBCLIENTPROGRAM = "/usr/bin/smbclient";
+
+# Declare server directory where files will be copied.
+my $FEWSREMOTEDIR = "data/$DBNAME/Import/Brookfield";
+
+# Define the location of the sftp program.
+my $SFTPPROGRAM = "/usr/bin/sftp";
+
+# Define the server dependent globals for the external TVA sftp server.
+my $SFTPSERVER            = "chapsftp.tva.gov";
+my $SFTPUSERID            = "tvabsmh";
+my $FROMBSMHSFTPDIRECTORY = "FromBSMH";
+
+# Define the work flow command to be run when new data is transferred.
+my $WORKFLOWCOMMAND = "/apps/rfc/system/bin/execute_workflow_linux.py " .
+                      "-workflow=";
+my $WORKFLOW1       = "ImportBrookfieldObserved";
+my $WORKFLOW2       = "ImportBrookfieldForecast";
+
+# Define the local temp and log files.
+my $LOCALTEMPDIR         = "/tmp/bsmh";
+my $LOCALDATADIR         = "/apps/rfc/system/data";
+my $SFTPCOMMANDSFILENAME = "$LOCALTEMPDIR/MoveBsmhFiles_" .
+                           "$PROCESSID.cmds";
+my $LOGFILENAME          = "/apps/rfc/system/logs/MoveBsmhFiles.log";
+
+# Define the archive folder for saving transferred files.  Files
+# are only saved on the PROD server.
+my $ARCHIVEDIR = "$LOCALDATADIR/bsmh_archive";
+
+# Define a hash that specifies the required information for each type
+# of BSMH file they send to TVA.  For each file type, the hash contains
+# an array with the following info: 
+# 0 - temp directory search string,
+# 1 - file extension of temp file used to indicate this file has already been
+#       processed,
+# 2 - name of workflow to be run on FS1 server,
+# 3 - string used to delete file type off chapsftp server,
+# 4 - FEWS filename for the processed file (date/time will be added).
+my %BSMHFILES = ( '3DayForecast' => [ 'grep csv | grep -i chilhowee | grep 3-day',
+                                      '3DayForecastTransferred',
+                                      'ImportBrookfieldForecast',
+                                      '*.3-day*.csv',
+                                      'RFC_Chilhowee-3Day_.csv',
+                                    ],
+                 '35DayForecast' => [ 'grep csv | grep -i chilhowee | grep -i 35-day',
+                                      '35DayForecastTransferred',
+                                      'ImportBrookfieldForecast',
+                                      '*.35-day*.csv',
+                                      'RFC_Chilhowee-35Day_.csv',
+                                    ],
+                      'Hourly'   => [ 'grep plnthr01.txt',
+                                      'HourlyTransferred',
+                                      'ImportBrookfieldObserved',
+                                      'plnthr01.txt',
+                                      'RFC_BSMH_Hourly_.txt',
+                                    ],
+                   'Corrected'   => [ 'grep csv | grep observed',
+                                      'CorrectedTransferred',
+                                      'ImportBrookfieldObserved',
+                                      '*observed.csv',
+                                      'RFC_BSMH_Observed_.txt',
+                                    ],
+                );
+
+########################################################################
+#
+########################################################################
+
+sub DeleteBsmhFilesOffSftpServer {
+
+  my ( $FilenameSearchString ) = @_;
+
+  my ( $Status, $CommandString,
+     );
+
+  # Create the files with the sftp commands.
+  unlink $SFTPCOMMANDSFILENAME if ( -e $SFTPCOMMANDSFILENAME );
+  open( FH1, ">$SFTPCOMMANDSFILENAME" );
+  print FH1 "cd $FROMBSMHSFTPDIRECTORY\n" .
+            "rm $FilenameSearchString\n" .
+            "quit\n";
+  close FH1;
+
+  # Create the command to delete the files from the source server.
+  $CommandString = "sftp -b $SFTPCOMMANDSFILENAME " .
+                   "$SFTPUSERID\@$SFTPSERVER";
+
+  # Execute the command.
+  $Status = `$CommandString 2>/dev/null`;
+
+  # Delete the file with the sftp commands.
+  unlink $SFTPCOMMANDSFILENAME;
+
+  return;
+
+} # End DeleteBsmhFilesOffSftpServer
+
+########################################################################
+#
+########################################################################
+
+sub CopyFilesFromSftpServer {
+
+  my ( $Status, $CommandString,
+     );
+
+  # Create the files with the sftp commands.
+  unlink $SFTPCOMMANDSFILENAME if ( -e $SFTPCOMMANDSFILENAME );
+  open( FH1, ">$SFTPCOMMANDSFILENAME" );
+  print FH1 "cd $FROMBSMHSFTPDIRECTORY\n" .
+            "lcd $LOCALTEMPDIR\n" .
+            "get *\n" .
+            "quit\n";
+  close FH1;
+
+  # Create the command to copy the files from the source server.
+  $CommandString = "$SFTPPROGRAM -b $SFTPCOMMANDSFILENAME " .
+                   "$SFTPUSERID\@$SFTPSERVER";
+
+  # Execute the command.
+  $Status = `$CommandString 2>/dev/null`;
+
+  # Delete the file with the sftp commands.
+  unlink $SFTPCOMMANDSFILENAME;
+
+  return;
+
+} # End CopyFilesFromSftpServer
+
+########################################################################
+# 
+# Copy the BSMH file to FEWS.
+#
+########################################################################
+
+sub CopyFilesToFewsServer {
+
+  my ( $SftpServerFileSearchString, $FewsFilenameTemplate ) = @_;
+
+  my ( @FilenameParts,
+       $BsmhFilename, $FewsFilename,
+       $DateTimeString, $CommandString, $Status,
+       $Base, $Path, $FileExtension,
+     );
+
+  # Break the FEWS filename template into 2 pieces.  The date/time
+  # string will be added to the filename between the period.
+  @FilenameParts = split/\./, $FewsFilenameTemplate;
+
+  # Find all files that need to be transferred.
+  while ( $BsmhFilename = <$LOCALTEMPDIR/$SftpServerFileSearchString> ) {
+
+    # Determine the file base, path and extension.
+    ( $Base, $Path, $FileExtension ) = fileparse( $BsmhFilename, '\..*' );
+
+    # Determine the current date/time to be used in the filename.
+    $DateTimeString = CurrentTVADateTime( 8 );
+
+    # Build the new FEWS formatted filename.
+    $FewsFilename = $FilenameParts[0] . $DateTimeString . "." .
+                    $FilenameParts[1];
+
+    # Build the samba command to copy the file to FEWS
+    $CommandString = "$SMBCLIENTPROGRAM //$FEWSSERVICENAME " .
+                     "-W $SMBWORKGROUP -U $SMBUSERID%$SMBUSERPASSWD " .
+                     "-c \"cd $FEWSREMOTEDIR; " .
+                     "lcd $LOCALTEMPDIR; " .
+                     "put $Base$FileExtension $FewsFilename\"";
+    $Status        = `$CommandString`;
+
+    # Log the filename change.
+    LogEntry( "BSMH file $BsmhFilename renamed to $FewsFilename" );
+
+    # Sleep one second to guarantee that if there is more
+    # than one file, the name will be different.
+    sleep 1;
+
+  } # end while
+
+  # If running on PROD, copy files to archive folder.
+  if ( $SERVERTYPE eq 'PROD' ) {
+
+    # If necessary, make the archive directory.
+    unless ( -e $ARCHIVEDIR ) {
+      mkdir $ARCHIVEDIR;
+    } # end unless
+    $CommandString = "cp $LOCALTEMPDIR/$SftpServerFileSearchString " .
+                     "$ARCHIVEDIR";
+    $Status        = `$CommandString`;
+
+  } # end if
+
+  return;
+
+} # End CopyFilesToFewsServer
+
+########################################################################
+#
+########################################################################
+
+sub LogEntry {
+
+  my ( $Message ) = @_;
+
+  my ( $DateTimeString,
+     );
+
+  # Open the log file for writing.
+  open( LFH, ">>$LOGFILENAME" );
+
+  # Determine the date/time and save the message to the log file.
+  $DateTimeString = `date '+%D %T'`;
+  chomp $DateTimeString;
+  print LFH "$DateTimeString - $Message\n";
+
+  # Close the log file.
+  close LFH;
+
+  return;
+
+} # End LogEntry
+
+########################################################################
+# 
+########################################################################
+
+sub Main {
+
+  my ( $CommandString, $Status, $FileCount, $NoActionTaken,
+       $LocalFileSearchString, $FileExtension, $WorkFlow,
+       $SftpServerFileSearchString, $FewsFilenameTemplate,
+       $LocalTestFilename,
+     );
+
+  # Make sure the local temp directory exists.
+  unless ( -e $LOCALTEMPDIR ) {
+    mkdir $LOCALTEMPDIR;
+  }
+
+  # Clear the local temp directory.
+  $CommandString = "rm -f $LOCALTEMPDIR/*";
+  $Status = `$CommandString`;
+
+  # Copy all BSMH files from the sftp server.
+  CopyFilesFromSftpServer();
+
+  # Assume no action was taken by script.
+  $NoActionTaken = 1;
+
+  # Process each file type.
+  foreach my $HashKey ( keys %BSMHFILES ) {
+
+    # Extract the hask values.
+    $LocalFileSearchString      = $BSMHFILES{$HashKey}[0] ;
+    $FileExtension              = $BSMHFILES{$HashKey}[1] ;
+    $WorkFlow                   = $BSMHFILES{$HashKey}[2] ;
+    $SftpServerFileSearchString = $BSMHFILES{$HashKey}[3] ;
+    $FewsFilenameTemplate       = $BSMHFILES{$HashKey}[4] ;
+
+    # Determine if the current file type has been xferred and
+    # processed and now needs to be deleted off the sftp server.
+    $LocalTestFilename = "$LOCALDATADIR/MoveBsmhFiles.$FileExtension";
+    if ( -e $LocalTestFilename ) {
+      DeleteBsmhFilesOffSftpServer( "$SftpServerFileSearchString" );
+      unlink $LocalTestFilename;
+
+      # Skip the remaining steps for this file type.  The file has
+      # already been processed.
+      next;
+
+    } # end if
+
+    # Determine if any of the current file type were transferred
+    # to the temp directory.
+    $CommandString = "ls -l $LOCALTEMPDIR 2>/dev/null | " .
+                     "$LocalFileSearchString | wc -l";
+    $FileCount = `$CommandString`;
+
+    # Remove the carriage return and trim any blanks from the file count.
+    chomp $FileCount;
+    $FileCount = Trim( $FileCount );
+  
+    # If the value of FileCount is greater than 0, files were transferred
+    # and the temp files transferred file needs to be created.
+    if ( $FileCount > 0 ) {
+
+      # Create the temporary file.
+      $CommandString = "touch $LOCALDATADIR/MoveBsmhFiles.$FileExtension";
+      $Status = `$CommandString`;
+
+      # Copy all files of the current type to the FEWS server.
+      CopyFilesToFewsServer( $SftpServerFileSearchString,
+                             $FewsFilenameTemplate );
+   
+      # Set the flag that files were processed.
+      $NoActionTaken = 0;
+
+    } # end if
+
+  } # end foreach
+
+  # Was any action taken during the script.
+  if ( $NoActionTaken ) {
+
+    # No new files found on sftp server.
+    LogEntry( "no files found on sftp server" );
+
+  } else {
+
+    # Execute the workflows on the FS server.
+    $CommandString = "${WORKFLOWCOMMAND}${WORKFLOW1}";
+    $Status        = `$CommandString`;
+    $CommandString = "${WORKFLOWCOMMAND}${WORKFLOW2}";
+    $Status        = `$CommandString`;
+
+  }
+
+  return;
+
+} # End Main
+
+########################################################################
+# 
+########################################################################
+
+# Call the Main routine.
+Main();

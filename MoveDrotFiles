@@ -1,0 +1,386 @@
+#!/usr/bin/perl
+#=========================================================================
+#
+# File: /apps/rfc/system/bin/MoveDrotFiles
+#
+# Purpose: This script is used to copy satellite collected DROT files
+#          from one of the DROT servers (knxpdrot or chapdrot) to the
+#          appropriate FEWS forecast shell server.
+# 
+# Inputs:  Files on the TVA sftp server that are copied there by Brookfield
+#            Smokey Mountain Hydro (BSMH).
+#          Temporary files in the data directory that indicate if the
+#            current files have already been transferred to the FS server.
+#          The sftp commands file that is dynamically created to hold
+#            commands to operate on files on the sftp server.
+#
+# Outputs: Transaction files copied to the appropriate FS server.
+#
+# Developer: Mike McGee
+#
+# Updates:
+#  1.0  09/26/2014  mpm  original code
+#  1.1  08/12/2015  mpm  use encryption routines to determine samba login info
+#  2.0  02/17/2016  mpm  switch to sftp to transfer files to FS1
+#  2.1  04/14/2016  mpm  execute FEWS workflow after transferring files
+#  2.2  05/03/2016  mpm  read database name from DetermineEnvironment app.
+#  2.3  06/14/2016  mpm  execute python script to run FEWS workflow
+#  2.4  07/18/2016  mpm  at the start of the script, verify that the previous
+#                          copy of the script is still not running
+#  2.5  10/11/2016  mpm  add a check for nothing in the PID file.
+#  3.0  03/15/2017  mpm  convert from sftp to smbclient for file xfers
+#                          to FEWS.
+#
+#==========================================================================
+
+use lib '/apps/rfc/system/lib';
+
+# Specify perl modules to load.
+use TvaGeneralRoutines;
+use UserIdsWithEncryption;
+use File::Basename;
+use File::Path;
+
+use strict;
+
+# Determine the process ID of the script.
+my $PROCESSID = $$;
+
+# Determine and set the name of the script
+my $SCRIPTNAME = basename( $0 );
+
+# Determine operating environment.
+my $TempString = `/apps/rfc/system/bin/DetermineEnvironment`;
+my ( $SERVERTYPE, $FORECASTSHELLSERVER, $DBNAME ) = split /,/, $TempString;
+
+# Define the loction of the samba client software.
+my $SMBCLIENTPROGRAM = "/usr/bin/smbclient";
+
+# Define the smbclient variables. The samba service name for
+# the FEWS FS1 server. All environments are the same except DEV.
+my $FEWSUSERID;
+my $FEWSUSERPASSWD;
+my $FEWSWORKGROUP;
+GetKeyInfo( "FS1_$SERVERTYPE", \$FEWSUSERID, \$FEWSUSERPASSWD, \$FEWSWORKGROUP );
+my $FEWSSERVICENAME = "$FORECASTSHELLSERVER/Fews";
+if ( $SERVERTYPE =~ "DEV" ) {
+  $FEWSSERVICENAME .= "_DEV";
+} # end if
+
+# Declare server directory where files will be copied.
+my $FEWSREMOTEDIR = "data/$DBNAME/Import/satellite";
+
+# Define the DROT smbclient variables.
+my $DROTUSERID;
+my $DROTUSERPASSWD;
+my $DROTWORKGROUP;
+GetKeyInfo( "DROT_$SERVERTYPE", \$DROTUSERID, \$DROTUSERPASSWD,
+            \$DROTWORKGROUP );
+
+# Define DROT specific variables.
+my $DROTSERVER;
+my $DROTTRANSACTIONDIR;
+if ( $SERVERTYPE =~ /PROD/ ) {
+  # Production definitions
+  $DROTSERVER    = "knxpdrot";
+  $DROTTRANSACTIONDIR = "TransactionFilesFEWSprod";
+} elsif ( $SERVERTYPE =~ /ACCP/ ) {
+  # Acceptance definitions
+  $DROTSERVER    = "chapdrot";
+  $DROTTRANSACTIONDIR = "TransactionFilesFEWSaccp";
+} elsif ( $SERVERTYPE =~ /DR/ ) {
+  # DR definitions
+  $DROTSERVER    = "chapdrot";
+  $DROTTRANSACTIONDIR = "TransactionFilesFEWSdr";
+} else {
+  # Development definitions
+  $DROTSERVER    = "chapdrot";
+  $DROTTRANSACTIONDIR = "TransactionFilesFEWSdev";
+} # end if
+my $DROTSERVICENAME = "$DROTSERVER/DROT";
+
+# Define the work flow command to be run when new data is transferred.
+my $WORKFLOWCOMMAND = "/apps/rfc/system/bin/execute_workflow_linux.py " .
+                      "-workflow=ImportSAT";
+
+# Define the local temporary directory used to hold files.
+my $LOCALTEMPDIR           = "/tmp/drotfiles";
+my $NUMBERFILESTRANSFERRED = 0;
+
+# Define the location and name of the log file.
+my $LOGFILENAME = "/apps/rfc/system/logs/MoveDrotFiles.log";
+
+# Set to 1 for debug printing, 0 otherwise.
+my $DEBUGFLAG = 0;
+
+# Set a flag to determine if system commands should be executed.
+my $EXECUTEFLAG = 1;
+
+########################################################################
+#
+########################################################################
+
+sub ExitIfAlreadyRunning {
+
+  my ( $ProcessIdFile, $CheckPid, $StillRunning,
+     );
+
+  # Define the file that will store the process ID.
+  $ProcessIdFile = "/apps/rfc/system/data/MoveDrotFiles.pid";
+
+  # Determine if the previous copy of MoveDrotFiles is
+  # still running.  This situation can happen when the
+  # LDM or FEWS server has been offline for a while and
+  # the DROT server has 300+ files to be transferred.
+  if ( -e $ProcessIdFile ) {
+    $CheckPid = `head -1 $ProcessIdFile`;
+    chomp $CheckPid;
+    # If CheckPid is blank, delete the file and continue on with
+    # the script.
+    if ( length( $CheckPid ) == 0 ) {
+      unlink $ProcessIdFile;
+    } else {
+      $StillRunning = kill 0, $CheckPid;
+      exit if ( $StillRunning );
+    } # end if
+  } # end if
+
+  # Save the current PID into the saved file.
+  open( FH1, ">$ProcessIdFile" );
+  print FH1 "$PROCESSID\n";
+  close FH1;
+
+  return;
+
+} # End ExitIfAlreadyRunning
+
+########################################################################
+#
+########################################################################
+
+sub CopyFilesFromDrot {
+
+  my ( $Status, $CommandString,
+     );
+
+  # Build the samba command to copy files from the DROT server.
+  $CommandString = "$SMBCLIENTPROGRAM //$DROTSERVICENAME " .
+                   "-W $DROTWORKGROUP -U $DROTUSERID%$DROTUSERPASSWD " .
+                   "-c \"cd $DROTTRANSACTIONDIR; " .
+                   "lcd $LOCALTEMPDIR; prompt; mget *\"";
+
+  if ( $EXECUTEFLAG ) { $Status = `$CommandString` };
+  if ( $DEBUGFLAG ) { print "CommandString is $CommandString\n" };
+
+  return;
+
+} # End CopyFilesFromDrot
+
+########################################################################
+#
+########################################################################
+
+sub CopyFilesToFews {
+
+  my ( $Status, $CommandString,
+     );
+
+  # Build the samba command to copy files to the FEWS server.
+  $CommandString = "$SMBCLIENTPROGRAM //$FEWSSERVICENAME " .
+                   "-W $FEWSWORKGROUP -U $FEWSUSERID%$FEWSUSERPASSWD " .
+                   "-c \"cd $FEWSREMOTEDIR; " .
+                   "lcd $LOCALTEMPDIR; prompt; mput *\"";
+
+  if ( $EXECUTEFLAG ) { $Status = `$CommandString` };
+  if ( $DEBUGFLAG ) { print "CommandString is $CommandString\n" };
+
+  return;
+
+} # End CopyFilesToFews
+
+########################################################################
+#
+########################################################################
+
+sub GetListOfFiles {
+
+  my ( $TransactionFilesArrayRef ) = @_;
+
+  my ( $CommandString, $FileList,
+       $Index,
+     );
+
+  # Create a list of all transaction files copied to the
+  # local temporary directory.
+  $CommandString = "ls $LOCALTEMPDIR";
+
+  # Execute the command.
+  $FileList = `$CommandString`;
+
+  # Extract the transaction filenames.
+  $Index = 0;
+  foreach my $Filename ( split /\n/, $FileList ) {
+
+    # Remove all leading and trailing blanks.
+    $Filename = Trim($Filename);
+
+    # Include all files that are the correct length and format.
+    if ( length($Filename) == 19 && substr($Filename, 4, 1) eq '-' ) {
+      $$TransactionFilesArrayRef[$Index++] = $Filename;
+    }
+
+  }
+
+  return;
+
+} # End GetListOfFiles
+
+########################################################################
+#
+########################################################################
+
+sub DeleteFilesOffDrot {
+
+  my ( $TransactionFilenamesArrayRef ) = @_;
+
+  my ( $FileList, $FileCount, $Index, $CommandString, $Status,
+     );
+
+  # Initialize the string and counter for the list of files
+  # to be deleted.
+  $FileList  = "";
+  $FileCount = 0;
+
+  # Start the loop to delete the processed transaction files
+  # off the DROT server.
+  for ( $Index = 0; $Index <= $#$TransactionFilenamesArrayRef; $Index++ ) {
+
+    # Add the current file to the file list.
+    $FileList .= "rm $$TransactionFilenamesArrayRef[$Index]; ";
+    $FileCount++;
+    $NUMBERFILESTRANSFERRED++;
+
+    # If the file list count is 10 or greater, issue the smbclient
+    # command to delete the files in the list.
+    if ( $FileCount >= 10 ) {
+
+      # Build the smbclient command to delete the current list of files.
+      # Remove the trailing semicolon and space from the file list.
+      $FileList = substr( $FileList, 0, -2 );
+      $CommandString = "$SMBCLIENTPROGRAM //$DROTSERVICENAME " .
+                       "-W $DROTWORKGROUP -U $DROTUSERID%$DROTUSERPASSWD " .
+                       "-c \"cd $DROTTRANSACTIONDIR; " .
+                       "$FileList\"";
+  
+      if ( $EXECUTEFLAG ) { $Status = `$CommandString` };
+      if ( $DEBUGFLAG ) { print "CommandString is $CommandString\n" };
+
+      # Blank out the file list and counter.
+      $FileList  = "";
+      $FileCount = 0;
+
+    } # end if
+
+  } # end for
+
+  # If the file count value is greater than zero, issue the command
+  # to delete the files in the list.
+  # Remove the trailing semicolon and space from the file list.
+  $FileList = substr( $FileList, 0, -2 );
+  $CommandString = "$SMBCLIENTPROGRAM //$DROTSERVICENAME " .
+                   "-W $DROTWORKGROUP -U $DROTUSERID%$DROTUSERPASSWD " .
+                   "-c \"cd $DROTTRANSACTIONDIR; " .
+                   "$FileList\"";
+
+  if ( $EXECUTEFLAG ) { $Status = `$CommandString` };
+  if ( $DEBUGFLAG ) { print "CommandString is $CommandString\n" };
+
+  return;
+
+} # End DeleteFilesOffDrot
+
+########################################################################
+#
+########################################################################
+
+sub LogEntry {
+
+  my ( $Message ) = @_;
+
+  my ( $DateTimeString,
+     );
+
+  # Open the log file for writing.
+  open( LFH, ">>$LOGFILENAME" );
+
+  # Determine the date/time and save the message to the log file.
+  $DateTimeString = `date '+%D %T'`;
+  chomp $DateTimeString;
+  print LFH "$DateTimeString - $Message\n";
+
+  # Close the log file.
+  close LFH;
+
+  return;
+
+} # End LogEntry
+
+########################################################################
+# 
+########################################################################
+
+sub Main {
+
+  my ( @TransactionFilenames,
+       $CommandString, $Status
+     );
+
+  # Check to see if the script is still running from the previous
+  # crontab execution.
+  ExitIfAlreadyRunning();
+
+  # Make sure the local temp directory exists.
+  unless ( -e $LOCALTEMPDIR ) {
+    mkdir $LOCALTEMPDIR;
+  } # end unless
+
+  # Clear the local temp directory.
+  $CommandString = "rm -f $LOCALTEMPDIR/*";
+  if ( $EXECUTEFLAG ) { $Status = `$CommandString` };
+  if ( $DEBUGFLAG ) { print "CommandString is $CommandString\n" };
+
+  # Copy the transaction data files from the drot.
+  CopyFilesFromDrot();
+
+  # Copy the transaction data files to the forecast shell server.
+  CopyFilesToFews();
+
+  # Create lists of the transferred transaction files.
+  GetListOfFiles( \@TransactionFilenames );
+
+  # Delete just the files transferred off the DROT server.
+  DeleteFilesOffDrot( \@TransactionFilenames );
+
+  # Execute the FEWS workflow to import the files.
+  if ( $EXECUTEFLAG ) { $Status = `$WORKFLOWCOMMAND` };
+  if ( $DEBUGFLAG ) { print "Executing workflow\n" };
+
+  # Clear the local temp directory.
+###  $CommandString = "rm $LOCALTEMPDIR/*";
+###  $Status = `$CommandString`;
+
+  # Save a log message with the number of files transferred.
+  if ( $EXECUTEFLAG ) { 
+    LogEntry( "$NUMBERFILESTRANSFERRED files copied to FEWS" );
+  } # end if
+
+  return;
+
+} # End Main
+
+########################################################################
+# 
+########################################################################
+
+# Call the Main routine.
+Main();

@@ -1,0 +1,321 @@
+#!/usr/bin/perl -w
+#=========================================================================
+#
+# File: /apps/rfc/system/bin/MoveEdsM10Files
+#
+# Purpose: Copies nuclear EDS 10MinWind files on cegnet1.
+#          Data files are copied for all three nuclear plants.
+#          
+#
+# Inputs:  Data files on the EDS server cegnet1.  
+#          Python script to execute FEWS workflow.
+#
+# Outputs: EDS files sent to FEWS.
+#          Log file for status messages.
+#
+# Developer: Danny Rider
+#
+# Updates:
+#  1.0  10/15/2017  dar  original code
+#
+#==###===================================================================
+
+use lib '/apps/rfc/system/lib';
+
+# Specify perl modules to load.
+use TvaGeneralRoutines;
+use UserIdsWithEncryption;
+use Time::Local;
+use Date::Calc qw(:all);
+
+# All variables must be declared.
+use strict;
+
+# Determine the process ID of the script.
+my $PROCESSID = $$;
+
+# Determine operating environment.
+my $TempString = `/apps/rfc/system/bin/DetermineEnvironment`;
+my ( $SERVERTYPE, $FORECASTSHELLSERVER, $DBNAME ) = split /,/, $TempString;
+
+# Define the smbclient variables. The samba service name for
+# the FEWS FS1 server. All environments are the same except DEV.
+my $SMBUSERID;
+my $SMBUSERPASSWD;
+my $SMBWORKGROUP;
+GetKeyInfo( "FS1_$SERVERTYPE", \$SMBUSERID, \$SMBUSERPASSWD, \$SMBWORKGROUP );
+my $SMBCLIENTPROGRAM = "/usr/bin/smbclient";
+
+# Declare server directory where files will be copied.
+my $FEWSREMOTEDIR = "data/$DBNAME/Import/EdsWindTenMin";
+
+# Define the work flow command to be run when new data is transferred.
+my $WORKFLOWCOMMAND = "/apps/rfc/system/bin/execute_workflow_linux.py " .
+                      "-workflow=ImportEDS";                      
+
+# Specify the EDS server name and login parameters.
+my $EDSSERVERNAME = "cegnet1.main.tva.gov";
+my $EDSSCPUSERID  = "ldm";
+
+# Directories where files will go on local server.
+my $LOCALTEMPDIR = "/tmp/edswind";
+
+# Define the log file.
+my $LOGFILENAME = "/apps/rfc/system/logs/MoveEdsWindTenMin.log";
+my $NUMBERFILESTRANSFERRED = 0;
+
+########################################################################
+#
+########################################################################
+
+sub CopyFilesFromEdsServer {
+
+  # Declare all variables used in the code.
+  my ( @MonthNames, @EdsDataTypes, @PlantCodes,
+       @ExtractDatesInSeconds, @FileContents,
+       $CurrentSeconds, $GetPreviousDayHour,
+       $LocalYear, $LocalMonth, $LocalDay, $LocalHour, $LocalMinute,
+       $EdsYear, $EdsMonth, $EdsDay, $EdsHour, $EdsMinute,
+       $TvaTimeInSeconds, $DayMonthYearString,
+       $EdsFilename, $LocalFilename, $ProcessFile,
+       $Command, $Status,
+     );
+
+  # Used for developing EDS filename.
+  @MonthNames = ( "jan", "feb", "mar", "apr", "may", "jun",
+                  "jul", "aug", "sep", "oct", "nov", "dec" );
+
+  # Define the two EDS data types to be transferred.
+  @EdsDataTypes = ( "M10" );
+
+  # Define the plant directory names on the EDS server.
+  @PlantCodes = ('sq','wb','bf');
+
+  # Determine current date in seconds.
+  $CurrentSeconds = time();
+
+  # Determine date/time for EDS time.
+  ( undef, $LocalMinute, $LocalHour, $LocalDay, $LocalMonth,
+    $LocalYear ) = localtime( $CurrentSeconds);
+  $LocalYear += 1900;
+
+  # Set the hour below which the scripts will also retrieve
+  # data for the previous day.
+  $GetPreviousDayHour = 3;
+
+  # If the current local hour is less than GetPreviousDayHour,
+  # retrieve EDS files for the current and previous days.
+  $ExtractDatesInSeconds[0] = $CurrentSeconds;
+  if ( $LocalHour < $GetPreviousDayHour ) {
+    # Subtract one day in seconds for the previous day.
+    $ExtractDatesInSeconds[1] = $CurrentSeconds - 24 * 60 * 60;
+  } # end if
+
+  # Loop for each data type to be transferred.
+  foreach my $EdsDataType ( @EdsDataTypes ) {
+
+    # Loop for each day to be extracted.  Normal just the current
+    # day until the hour is less than 3.
+    foreach my $DateInSeconds ( @ExtractDatesInSeconds ) {
+
+      # Server is in EPT, TVA time is CPT.
+      $TvaTimeInSeconds = $DateInSeconds - 3600;
+
+      # Determine date/time values for EDS time.
+      ( undef, $EdsMinute, $EdsHour, $EdsDay, $EdsMonth, $EdsYear ) =
+        localtime( $TvaTimeInSeconds );
+
+      # Convert two digit year to four digit year.
+      $EdsYear += 1900;
+
+      # Build the base part of the EDS file name,
+      # in the form <2 digit day>-<3 char month>-<4 digit year>.
+      $DayMonthYearString = sprintf("%d",$EdsDay) . "-" . $MonthNames[$EdsMonth] .
+                            "-" . $EdsYear;
+
+      # Build the filename to look for on the EDS server.
+      $EdsFilename = $DayMonthYearString . "." . lc( $EdsDataType );
+
+      # Retrieve the same file for each of the nuclear plants.
+      foreach my $SiteCode ( @PlantCodes ) {
+
+        # Danny Uncomment this to store files with separate names every 10 min
+        # Build the name of the output file on the local server.
+         $LocalFilename = "HT_" . uc( $SiteCode ) . "N-" .
+                          $EdsDataType . "_EDS_" .
+                          sprintf( "%04d", $EdsYear ) .
+                          sprintf( "%02d", $EdsMonth+1 ) .
+                          sprintf( "%02d", $EdsDay ) .
+                          sprintf( "%02d", $EdsHour ) .
+                          sprintf( "%02d", $EdsMinute ) .
+                          ".dat";
+
+        # Use scp to copy the current file from the EDS server
+        # to the local server.
+        $Command = "scp $EDSSCPUSERID\@$EDSSERVERNAME:$SiteCode/" .
+                   "$EdsFilename $LOCALTEMPDIR/$LocalFilename";
+                                         # use $LocalFileName if creating separate 10min files.
+        # Execute the command.
+        $Status = `$Command 2>/dev/null`;
+        if (-e "$LOCALTEMPDIR/$LocalFilename" )
+        {
+             # Increment the number of files transferred
+             $NUMBERFILESTRANSFERRED++;
+        }      
+
+      } # end foreach site
+
+    } # end foreach DateInSeconds
+
+  } # end foreach EdsFilenameExt
+
+  return;
+
+} # end CopyFilesFromEdsServer
+
+
+########################################################################
+#
+########################################################################
+
+sub TranslateEdsFiles {
+
+  my ( $CommandString, $Status,
+     );
+
+  # Define the character string that cause issues in FEWS and
+  # the new character string they will be transleted to.
+  my @TranslateFrom = ( "*C", "UC", "*E","UE","*I","UI" );
+  my @TranslateTo   = ( "*C,", "UC,", "*E,","UE,","*I,","UI," );
+
+  # For each of the EDS files in the temp directory, translate
+  # the character strings that cause issues in the FEWS config
+  # files.
+  foreach my $FileName ( <$LOCALTEMPDIR/*.dat> ) {
+
+    print "FileName is $FileName\n";
+
+    # Build and execute the commands to translate the invalid 
+    # characters.
+    for ( my $i=0; $i <= $#TranslateFrom; $i++ ) {
+
+      # Build and execute the sed command to translate the
+      # character strings.
+      $CommandString = "sed -i \"s/$TranslateFrom[$i]/" .
+                       "$TranslateTo[$i]/g\" $FileName";
+      $Status        = `$CommandString`;
+
+    } # end for
+
+  } # end foreach
+
+  return;
+
+} # end TranslateEdsFiles
+
+########################################################################
+#
+########################################################################
+
+sub CopyFilesToFewsServer {
+
+  my ( $FewsServiceName, $CommandString, $Status,
+     );
+
+  # Determine the samba service name for the FEWS FS1 server.
+  # All environments are the same except DEV.
+  $FewsServiceName = "$FORECASTSHELLSERVER/Fews";
+  if ( $SERVERTYPE =~ "DEV" ) {
+    $FewsServiceName .= "_DEV";
+  } # end if
+
+  # Build the samba command to copy the file to FEWS.
+  $CommandString = "$SMBCLIENTPROGRAM //$FewsServiceName " .
+                   "-W $SMBWORKGROUP -U $SMBUSERID%$SMBUSERPASSWD " .
+                   "-c \"cd $FEWSREMOTEDIR; lcd $LOCALTEMPDIR; " .
+                   "prompt; mput *\"";
+  $Status = `$CommandString`;
+
+  return;
+
+} # end CopyFilesToFewsServer
+
+########################################################################
+#
+########################################################################
+
+sub LogEntry {
+
+  my ( $Message ) = @_;
+
+  my ( $DateTimeString,
+     );
+
+  # Open the log file for writing.
+  open( LFH, ">>$LOGFILENAME" );
+
+  # Determine the date/time and save the message to the log file.
+  $DateTimeString = CurrentTVADateTime( 5 );
+  print LFH "$DateTimeString - $Message\n";
+
+  # Close the log file.
+  close LFH;
+
+  return;
+
+} # End LogEntry
+
+########################################################################
+#
+########################################################################
+
+sub Main {
+
+  my ( $CommandString, $Status,
+     );
+
+  # Make sure the local temp directory exists.
+  unless ( -e $LOCALTEMPDIR ) {
+    mkdir $LOCALTEMPDIR;
+    chmod 0777, $LOCALTEMPDIR;
+  }
+
+  # Clear the local temp directory.
+  $CommandString = "rm -f $LOCALTEMPDIR/*";
+  $Status        = `$CommandString`;
+
+  # Copy the appropriate files from the EDS server to the local server.
+  CopyFilesFromEdsServer();
+
+  # If at least one file was copied from the EDS server,
+  # copy file to the FEWS FS server.
+  if ( $NUMBERFILESTRANSFERRED > 0 ) {
+
+    # Translate character strings in EDS data files.
+    TranslateEdsFiles();
+
+    # Copy file to the FEWS FS server.
+    CopyFilesToFewsServer();
+
+    # Execute the FEWS workflow to import the files.
+    $Status = `$WORKFLOWCOMMAND`;
+
+  } # end if
+
+  # Delete any files off the local directory.
+###  $CommandString = "rm -f $LOCALTEMPDIR/*";
+###  $Status = `$CommandString`;
+
+  # Log the number of files transferred.
+  LogEntry( "$NUMBERFILESTRANSFERRED copied from EDS to FEWS" );
+
+  return;
+
+} # End Main
+
+########################################################################
+#
+########################################################################
+
+# Call the Main routine.
+Main();

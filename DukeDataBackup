@@ -1,0 +1,294 @@
+#!/usr/bin/perl -w
+#############################################################################
+#
+# File: /apps/rfc/system/bin/DukeDataBackup
+#
+# Purpose: Backup process to access the Duke data for it's dams.
+#          The script downloads a NWS web site and transfers the
+#          file contains to the appropriate FS server.  After the
+#          file is copied, the Duke observed and forecasted data
+#          workflows are run.  The observed workflow must be run
+#          first because the forecast data workflow deletes the
+#          data file when complete.
+#
+# Inputs:  NWS web site with data for the Nantahala system.
+#          Python script to execute two FEWS workflows.
+#
+# Outputs: Contains of the NWS web site sent to FEWS FS1 server.
+#          Log file for status messages.
+#
+# Developer: Mike McGee
+#         
+# Updates:
+# 1.0  02/27/2017  mpm  Original code developed.
+# 2.0  04/04/2017  mpm  Add code to strip all HTML from the file sent
+#                         to the FEWS FS1 server.  Only the SHEF formatted
+#                         lines, inside the pre tags, are sent to FEWS.
+#       
+#############################################################################
+
+# Include the team's perl library in the search path.
+use lib '/apps/rfc/system/lib';
+
+# Include any CPAN libraries that are used.
+use TvaGeneralRoutines;
+use UserIdsWithEncryption;
+use Date::Calc qw(:all);
+#use LWP::UserAgent;
+use LWP;
+use File::Basename;
+
+# All variables must be declared.
+use strict;
+
+# Determine and set the name of the script
+my $SCRIPTNAME = basename( $0 );
+
+# Determine the script process ID.
+my $PROCESSID = $$;
+
+# Define the name of the server running the script.
+my $SERVERNAME = `uname -n`;
+
+# Determine operating environment.
+my $TempString = `/apps/rfc/system/bin/DetermineEnvironment`;
+my ( $SERVERTYPE, $FORECASTSHELLSERVER, $DBNAME ) = split /,/, $TempString;
+
+# Define the smbclient variables.
+my $SMBUSERID;
+my $SMBUSERPASSWD;
+my $SMBWORKGROUP;
+GetKeyInfo( "FS1_$SERVERTYPE", \$SMBUSERID, \$SMBUSERPASSWD, \$SMBWORKGROUP );
+my $SMBCLIENTPROGRAM = "/usr/bin/smbclient";
+
+# Declare server directory where files will be copied.
+my $FEWSREMOTEDIR = "data/$DBNAME/Import/DukePower";
+my $FEWSFILENAMEPREFIX    = "CAERR2GSP";
+my $FEWSFILENAMEEXTENSION = "shef";
+
+# Define the work flow commands to be run when new data is transferred.
+my $WORKFLOWCOMMAND1 = "/apps/rfc/system/bin/execute_workflow_linux.py " .
+                       "-workflow=ImportDukeObserved";
+my $WORKFLOWCOMMAND2 = "/apps/rfc/system/bin/execute_workflow_linux.py " .
+                       "-workflow=ImportDukeForecast";
+
+# Define the weather data web site to access for the Duke data.
+my $WEBSITE = "http://forecast.weather.gov/product.php?site=NWS&" .
+              "issuedby=GSP&product=RR2&format=CI&version=3&" .
+              "glossary=0";
+my $TEMPFILENAME1 = "/tmp/${SCRIPTNAME}_${PROCESSID}.temp";
+my $TEMPFILENAME2 = "/tmp/${SCRIPTNAME}_${PROCESSID}.dat";
+
+# Define the scripts log filename.
+my $LOGFILENAME = "/apps/rfc/system/logs/$SCRIPTNAME.log";
+
+########################################################################
+#
+# Download the Duke data from the NWS web site.
+#
+########################################################################
+
+sub DownloadDukeDataNew {
+
+  my ( $UserAgent, $Request, $Response, $FileContents,
+     );
+
+print "WEBSITE is $WEBSITE\n";
+  # Create the user agent object to be used in the loop below.
+  $UserAgent = LWP::UserAgent->new( ssl_opts => {verify_hostname => 0} );
+
+  # Access and save the gage datum.
+#  $Request      = HTTP::Request->new( GET => "$WEBSITE" );
+  $Response     = $UserAgent->get( $WEBSITE );
+  $FileContents = $Response->content();
+
+  # Save the file contains to the Temporary file.
+  open( FH1, ">$TEMPFILENAME1" );
+  print FH1 $FileContents;
+  close FH1;
+
+  return;
+
+} # end DownloadDukeData
+
+
+########################################################################
+#
+# Download the Duke data from the NWS web site.
+#
+########################################################################
+
+sub DownloadDukeData {
+
+  my ( $UserAgent, $Request, $Response, $FileContents,
+     );
+
+  # Create the user agent object to be used in the loop below.
+  $UserAgent = LWP::UserAgent->new( ssl_opts => {verify_hostname => 0} );
+
+  # Access and save the gage datum.
+  $Request      = HTTP::Request->new( GET => "$WEBSITE" );
+  $Response     = $UserAgent->request( $Request );
+  $FileContents = $Response->content();
+
+  # Save the file contains to the Temporary file.
+  open( FH1, ">$TEMPFILENAME1" );
+  print FH1 $FileContents;
+  close FH1;
+
+  return;
+
+} # end DownloadDukeData
+
+
+########################################################################
+#
+# Strip the HTML from the SHEF data file.
+#
+########################################################################
+
+sub StripHtml {
+
+  my ( $Line,
+     );
+
+  # Open the downloaded file for read only.
+  open( FH1, "<$TEMPFILENAME1" );
+
+  # Open the second temp file for output.
+  open( FH2, ">$TEMPFILENAME2" );
+
+  # Read the download file looking for the <pre> tag.
+  while ( $Line = <FH1> ) {
+
+    # Exit when the opening pre tag is found.
+    last if ( $Line =~ m/<pre/i );
+
+  } # end while
+
+  # Start reading and saving the SHEF formatted data.  Stop
+  # when the </pre> tag is found.
+  while ( $Line = <FH1> ) {
+
+    # Exit if the ending pre tage is found.
+    last if ( $Line =~ m/<\/pre>/i );
+
+    # Ending pre tag not found so save the current line.
+    print FH2 $Line;
+
+  } # end while
+
+  # Close the input and output files.
+  close FH1;
+  close FH2;
+
+  # Delete the input file containing the unwanted HTML.
+  unlink $TEMPFILENAME1;
+
+  return;
+
+} # end StripHtml
+
+
+########################################################################
+#
+# Copy the NWS file to FEWS using samba smbclient.
+#
+########################################################################
+
+sub CopyFileToFews {
+
+  my ( $Request, $Response, $FileContents,
+       $DateTimeString, $FewsFilename,
+       $FewsServiceName, $CommandString, $Status,
+     );
+
+  # Build the FEWS filename with the current date/time.
+  $DateTimeString = CurrentTVADateTime( 8 );
+  $FewsFilename = "${FEWSFILENAMEPREFIX}_${DateTimeString}." .
+                  "${FEWSFILENAMEEXTENSION}";
+
+  # Determine the samba service name for the FEWS FS1 server.
+  # All environments are the same except DEV.
+  $FewsServiceName = "$FORECASTSHELLSERVER/Fews";
+  if ( $SERVERTYPE =~ "DEV" ) {
+    $FewsServiceName .= "_DEV";
+  } # end if
+
+  # Build the samba command to copy the file to FEWS.
+  $CommandString = "$SMBCLIENTPROGRAM //$FewsServiceName " .
+                   "-W $SMBWORKGROUP -U $SMBUSERID%$SMBUSERPASSWD " .
+                   "-c \"cd $FEWSREMOTEDIR; put $TEMPFILENAME2 " .
+                   "$FewsFilename\"";
+  $Status = `$CommandString`;
+
+  # Execute the FEWS workflow(s);
+  $Status = `$WORKFLOWCOMMAND1`;
+  $Status = `$WORKFLOWCOMMAND2`;
+
+  # Save a log message.
+  LogEntry( "$FewsFilename sent to $FORECASTSHELLSERVER" );
+
+  # Delete the temporary file.
+  unlink $TEMPFILENAME2;
+
+  return;
+
+} # end CopyFileToFews
+
+
+########################################################################
+#
+########################################################################
+
+sub LogEntry {
+
+  my ( $Message ) = @_;
+
+  my ( $DateTimeString,
+     );
+
+  # Open the log file for writing.
+  open( LFH, ">>$LOGFILENAME" );
+
+  # Determine the date/time and save the message to the log file.
+  $DateTimeString = `date '+%D %T'`;
+  chomp $DateTimeString;
+  print LFH "$DateTimeString - $Message\n";
+
+  # Close the log file.
+  close LFH;
+
+  return;
+
+} # End LogEntry
+
+
+########################################################################
+#
+# Main procedure
+#
+########################################################################
+
+sub MainProcedure {
+
+  # Download the Duke data from the NWS.
+  DownloadDukeData();
+
+  # Strip the html line from the dowloaded web page
+  StripHtml();
+
+  # Copy the file contents to the FEWS FS1 server.
+  CopyFileToFews();
+
+  return;
+}
+
+
+########################################################################
+#
+# Call the main procedure
+#
+########################################################################
+
+MainProcedure;

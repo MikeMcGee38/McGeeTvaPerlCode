@@ -1,0 +1,649 @@
+#!/usr/bin/perl
+#============================================================================
+#
+# File: /apps/rfc/system/bin/MoveNwsFiles
+#
+# Purpose: This script is run to copy NWS grib files from chapsftp to the
+#          various FEWS FS1 servers.  The script is only run on the PROD
+#          LDM server and copies files to the 4 FEWS environments.
+#
+# Inputs:  Files on the TVA sftp server that are copied there by the
+#          Nathional Weather Service.
+#
+# Outputs: Files copied to FEWS FS1 servers.  Filenames are not changed
+#          from the NWS names.
+#
+# Developer: Mike McGee
+#
+# Updates:
+#  1.0  03/29/2017  mpm  original code
+#  1.1  03/30/2017  mpm  develop a list of files in temp directory and
+#                          only delete those files.  this is necessary
+#                          in case new files are sent to chapsftp between
+#                          the time files are copied off and files are
+#                          deleted.
+#  1.2  04/11/2017  mpm  copy all processed files to an archive folder
+#                          under /tmp.
+#  2.0  04/12/2017  mpm  add more file types to be processed.  specify
+#                          how the filename is transformed before being
+#                          copied to FEWS.  add a field to specify the
+#                          directory where the files are copied to on
+#                          the appropriate FS1 server.
+#  2.1  07/05/2017  mpm  changes to specs for NWS files to be sent to
+#                          the FEWS FS1 servers.  one new file type to
+#                          search for and changes to four existing files
+#                          specs.
+#  2.2  07/06/2017  mpm  only archive files in temp dir that match the
+#                          search file specs in the hash.  any remaining
+#                          files are not processed and the file list 
+#                          should be sent to the email list.
+#
+#============================================================================
+
+use lib '/apps/rfc/system/lib';
+
+# Specify perl modules to load.
+use TvaGeneralRoutines;
+use UserIdsWithEncryption;
+use File::Basename;
+use File::Path;
+use Date::Calc qw(:all);
+
+use strict;
+
+# Determine the process ID of the script.
+my $PROCESSID = $$;
+
+# Determine and set the name of the script
+my $SCRIPTNAME = basename( $0 );
+
+# Determine operating environment.
+my $TempString = `/apps/rfc/system/bin/DetermineEnvironment`;
+my ( $SERVERTYPE, $FORECASTSHELLSERVER, $DBNAME ) = split /,/, $TempString;
+
+# Only run this script in the production enviroment.
+exit if ( $SERVERTYPE !~ /PROD/ );
+
+# Define the smbclient variables. The samba service name for
+# the FEWS FS1 server. All environments are the same except DEV.
+my $SMBUSERID;
+my $SMBUSERPASSWD;
+my $SMBWORKGROUP;
+GetKeyInfo( "FS1_$SERVERTYPE", \$SMBUSERID, \$SMBUSERPASSWD, \$SMBWORKGROUP );
+my $SMBCLIENTPROGRAM = "/usr/bin/smbclient";
+
+# Declare server directory where files will be copied.
+my $FEWSREMOTEDIR1 = "data/";
+my $FEWSREMOTEDIR2 = "/Import";
+
+# Define the location of the sftp program.
+my $SFTPPROGRAM = "/usr/bin/sftp";
+
+# Define the server dependent globals for the external TVA sftp server.
+my $SFTPSERVER            = "chapsftp.tva.gov";
+my $SFTPUSERID            = "nws";
+my $FROMNWSSFTPDIRECTORY = "FromLMRFC";
+
+# Define the work flow command to be run when new data is transferred.
+my $WORKFLOWCOMMAND = "/apps/rfc/system/bin/execute_workflow_linux.py " .
+                      "-workflow=";
+
+# Define the user ID for running ssh to execute the import scripts
+# on the other LDM servers.
+my $SSHUSERID = "rvsldm";
+
+# List of FEWS servers where files are copied.
+my @FEWSFS1SERVERLIST = ( "knxdwfewsfs1.main.tva.gov",
+                          "chaawfewsfs1.main.tva.gov",
+                          "knxpwfewsfs1.main.tva.gov",
+                          "knxpwfewsfs2.main.tva.gov",
+                        );
+
+# List of FEWS LDM servers where workflows are run using ssh.
+my @FEWSLDMSERVERLIST = ( "fewsldmd1.main.tva.gov",
+                          "fewsldma1.main.tva.gov",
+                          "fewsldmp1.main.tva.gov",
+                          "fewsldmp2.main.tva.gov",
+                        );
+
+# Define the names of the FEWS databases in the various environments.
+my @FEWSDBNAMELIST = ( "ustetvdmc00",
+                       "ustetvamc00",
+                       "ustetvpmc00",
+                       "ustetvpmc01",
+                     );
+
+# List of email addresses that receive the list of unprocessed files.
+my @EmailList = ( "darider\@tva.gov", "gamiller0\@tva.gov",
+                  "mpmcgee\@tva.gov",
+                );
+
+# Define the local temp and log files.
+my $LOCALTEMPDIR         = "/tmp/nws";
+my $LOCALARCHIVEDIR      = "/tmp/nws_archive";
+my $LOCALRENAMEDIR       = "/tmp/nws_temp";
+my $LOCALDATADIR         = "/apps/rfc/system/data";
+my $SFTPCOMMANDSFILENAME = "$LOCALTEMPDIR/MoveNwsFiles_" .
+                           "$PROCESSID.cmds";
+my $LOGFILENAME          = "/apps/rfc/system/logs/MoveNwsFiles.log";
+
+# Define a hash that specifies the required information for each type
+# of NWS file they send to TVA.  For each file type, the hash contains
+# an array with the following info:
+# 0 - temp directory search string,
+# 1 - name of workflow to be run on FS1 server,
+# 2 - string used to find temp files to be copied to FEWS servers
+# 3 - format for transforming the filename before sending to FEWS
+# 4 - directory, under Import, on FS1 where the files are copied
+my %NWSFILES = ( 'GribFiles'  => [ 'grep grib',
+                                   'ImportLMRFC_QPE',
+                                   '*.grib',
+                                   '$BASE.$EXT',
+                                   'QPE/LMRFC',
+                                 ],
+                'OrnQpfFiles' => [ 'grep grb | grep ORN',
+                                   'ImportLMRFC_QPF',
+                                   'ORN_QPF_SFC**.grb',
+                                   '$BASE.$EXT',
+                                   'QPF/MostLikely/LMRFC',
+                                 ],
+                'NaefsQpfFiles' => [ 'grep NAEFSmean_netcdf',
+                                   'ImportLMRFC_QPF',
+                                   'NAEFSmean_netcdf*.nc',
+                                   '$BASE_$DATETIME.nc',
+                                   'QPF/NAEFS/LMRFC',
+                                 ],
+                 '05GrbFiles' => [ 'grep grb | grep 05pt',
+                                   'ImportLMRFC_QPF',
+                                   '*05pt*.grb',
+                                   '$BASE_$DATETIME.grib',
+                                   'QPF/05Min/LMRFC',
+                                 ],
+                 '95GrbFiles' => [ 'grep grb | grep 95pt',
+                                   'ImportLMRFC_QPF',
+                                   '*95pt*.grb',
+                                   '$BASE_$DATETIME.grib',
+                                   'QPF/95Max/LMRFC',
+                                 ],
+                 'CAERR2GSP'  => [ 'grep CAERR2GSP',
+                                   'ImportDukeForecast',
+                                   'CAERR2GSP*',
+                                   '$BASE_$DATETIME.shef',
+                                   'DukePower',
+                                 ],
+                 'NEWRVFLOM1' => [ 'grep NEWRVFLOM',
+                                   'ImportLMRFCForecast',
+                                   'NEWRVFLOM*',
+                                   '$BASE_$DATETIME.shef',
+                                   'RiverForecasts/LMRFC',
+                                 ],
+                 'NEWRVFLOM2' => [ 'grep NEWRVFLOM',
+                                   'ImportOHRFCForecast',
+                                   'NEWRVFLOM*',
+                                   '$BASE_$DATETIME.shef',
+                                   'RiverForecasts/LMRFC',
+                                 ],
+                 'CRWRVFLOM1' => [ 'grep CRWRVFLOM',
+                                   'ImportOHRFCObserved',
+                                   'CRWRVFLOM*',
+                                   '$BASE_$DATETIME.shef',
+                                   'RiverForecasts/OHRFC',
+                                 ],
+                 'CRWRVFLOM2' => [ 'grep CRWRVFLOM',
+                                   'ImportOHRFCForecast',
+                                   'CRWRVFLOM*',
+                                   '$BASE_$DATETIME.shef',
+                                   'RiverForecasts/OHRFC',
+                                 ],
+                 'Forecast'   => [ 'grep LMRFC_FORECAST',
+                                   'ImportLMRFCForecast',
+                                   'LMRFC_FORECAST*',
+                                   '$BASE.pixml',
+                                   'RiverForecasts/LMRFC',
+                                 ],
+                 '240HRQPF'   => [ 'grep qpf | grep 240hr',
+                                   'ImportLMRFCForecast',
+                                   '*qpf_240hr*.*',
+                                   '$BASE_$DATETIME.shef',
+                                   'RiverForecasts/LMRFC',
+                                 ],
+                   'FCST_PAH' => [ 'grep fcst_pah',
+                                   'ImportPaducah',
+                                   '*fcst_pah*',
+                                   '$BASE_$DATETIME.shef',
+                                   'PaducahStage',
+                                 ],
+        'INFLOWS_OPERATIONAL' => [ 'grep Inflows_Operational',
+                                   'ImportLMRFCForecast',
+                                   '*Inflows_Operational*',
+                                   'LMRFC_FORECAST_$DATETIME.pixml',
+                                   'RiverForecasts/LMRFC',
+                                 ],
+                );
+########################################################################
+#
+########################################################################
+
+sub CopyFilesFromSftpServer {
+
+  my ( $Status, $CommandString,
+     );
+
+  # Create the files with the sftp commands.
+  unlink $SFTPCOMMANDSFILENAME if ( -e $SFTPCOMMANDSFILENAME );
+  open( FH1, ">$SFTPCOMMANDSFILENAME" );
+  print FH1 "cd $FROMNWSSFTPDIRECTORY\n" .
+            "lcd $LOCALTEMPDIR\n" .
+            "get *\n" .
+            "quit\n";
+  close FH1;
+
+  # Create the command to copy the files from the source server.
+  $CommandString = "$SFTPPROGRAM -b $SFTPCOMMANDSFILENAME " .
+                   "$SFTPUSERID\@$SFTPSERVER";
+
+  # Execute the command.
+  $Status = `$CommandString 2>/dev/null`;
+
+  # Delete the file with the sftp commands.
+  unlink $SFTPCOMMANDSFILENAME;
+
+  return;
+
+} # End CopyFilesFromSftpServer
+
+########################################################################
+# 
+# Copy the NWS file to FEWS.
+#
+########################################################################
+
+sub CopyFilesToFewsServer {
+
+  my ( $SearchString, $TransformationString, $FewsSubdir ) = @_;
+
+  my ( $CommandString, $Status,
+       $ServiceName, $FewsRemoteDirectory,
+       $FilenameBase, $FilenameExt,
+       $DateTimeString, $FileList, $NewFilename,
+       $FileCount,
+     );
+
+  # Determine the current date/time string to be used below.
+  $DateTimeString = CurrentTVADateTime( 5 );
+
+  # Clear any files in the rename directory.
+  $CommandString = "rm -f $LOCALRENAMEDIR/*";
+  $Status = `$CommandString`;
+
+  # Copy all files matching the search string to the
+  # rename directory.
+  $CommandString = "cp $LOCALTEMPDIR/$SearchString $LOCALRENAMEDIR";
+  $Status = `$CommandString`;
+
+  # Determine if any files were copied to the rename directory.
+  $CommandString = "ls -1 $LOCALRENAMEDIR 2>/dev/null | wc -l";
+  $FileCount = `$CommandString`;
+
+  # Remove the carriage return and trim any blanks from the file count.
+  chomp $FileCount;
+  $FileCount = Trim( $FileCount );
+
+  # If the value of FileCount is greater than 0, there are no
+  # files to be copied to FEWS.  If FileCount is zero, return 0
+  # to the calling routine so the associated workflow is NOT
+  # called.
+  return 0 unless ( $FileCount > 0 );
+
+  # Create a list of all files in the rename directory so they
+  # can be renamed per the format in the NWSFILES hash.
+  $CommandString = "ls $LOCALRENAMEDIR";
+  $FileList      = `$CommandString`;
+
+  # Rename each file found.
+  foreach my $Filename ( split /\n/, $FileList ) {
+
+    # Remove all leading and trailing blanks.
+    $Filename = Trim( $Filename );
+
+    # Parse the filename by the period.
+    ( $FilenameBase, $FilenameExt ) = split /\./, $Filename;
+
+    # Build the new filename.
+    $NewFilename = $TransformationString;
+    $NewFilename =~ s/\$BASE/$FilenameBase/;
+    $NewFilename =~ s/\$EXT/$FilenameExt/;
+    $NewFilename =~ s/\$DATETIME/$DateTimeString/;
+
+    # Move the existing file to the new filename.
+    if ( $Filename ne $NewFilename ) {
+      $CommandString = "mv $LOCALRENAMEDIR/$Filename " .
+                       "$LOCALRENAMEDIR/$NewFilename";
+      $Status        = `$CommandString`;
+      LogEntry("NWS file $NewFilename copied");
+    } # end if
+
+  } # end foreach
+
+  # Copy all the transferred files to the 4 FS1 environments.
+  for ( my $i=0; $i<=$#FEWSFS1SERVERLIST; $i++ ) {
+
+    # Determine the name of the FEWS samba service name.
+    $ServiceName = "$FEWSFS1SERVERLIST[$i]/FEWS";
+
+    # If the DEV environment, add the special case.
+    if ( $FEWSFS1SERVERLIST[$i] =~ m/dw/ ) {
+      $ServiceName .= "_DEV";
+    } # end if
+
+    # Build the name of the remote directory where the file 
+    # will be copied.
+    $FewsRemoteDirectory = "$FEWSREMOTEDIR1" .
+                           $FEWSDBNAMELIST[$i] .
+                           "$FEWSREMOTEDIR2" .
+                           "/$FewsSubdir";
+
+    # Build the samba command to copy the file to FEWS
+    $CommandString = "$SMBCLIENTPROGRAM //$ServiceName " .
+                     "-W $SMBWORKGROUP -U $SMBUSERID%$SMBUSERPASSWD " .
+                     "-c \"cd $FewsRemoteDirectory; " .
+                     "lcd $LOCALRENAMEDIR; " .
+                     "prompt; mput *\"";
+    $Status        = `$CommandString`;
+
+  } # end for
+
+  # Return a positve value so the calling routine knows to
+  # run the associated workflow.
+  return 1;
+
+} # End CopyFilesToFewsServer
+
+########################################################################
+#
+########################################################################
+
+sub RunWorkflows {
+
+  my ( $WorkFlow ) = @_;
+
+  my ( $CommandString, $Status,
+     );
+
+  # Build the ssh comand string to execute the workflow
+  # on the FEWS LDM servers.
+  for ( my $i=0; $i<= $#FEWSLDMSERVERLIST; $i++ ) {
+
+    # Create the command to run workflow on the current server.
+    # Even if the current server is the one running this script,
+    # use the ssh command for consistency.
+    $CommandString = "ssh $SSHUSERID\@$FEWSLDMSERVERLIST[$i] " .
+                     "${WORKFLOWCOMMAND}${WorkFlow}";
+
+    # Execute the command.
+    $Status = `$CommandString`;
+
+  } # end for
+
+  return;
+
+} # End RunWorkflows
+
+########################################################################
+#
+########################################################################
+
+sub DeleteNwsFilesOffSftpServer {
+
+  my ( $Status, $CommandString, $FileList,
+     );
+
+  # Create the file with the sftp commands.
+  unlink $SFTPCOMMANDSFILENAME if ( -e $SFTPCOMMANDSFILENAME );
+  open( FH1, ">$SFTPCOMMANDSFILENAME" );
+  print FH1 "cd $FROMNWSSFTPDIRECTORY\n";
+
+  # Create a list of all transaction files copied to the
+  # local temporary directory.
+  $CommandString = "ls $LOCALTEMPDIR";
+
+  # Execute the command.
+  $FileList = `$CommandString`;
+
+  # Add a command to the sftp file to delete each file in the 
+  # temp directory.  Skip the file if its the sftp commands
+  # file.
+  foreach my $Filename ( split /\n/, $FileList ) {
+
+    # Remove all leading and trailing blanks.
+    $Filename = Trim($Filename);
+
+    # Skip the sftp commands file.
+    next if ( $Filename =~ m/cmds/ );
+
+    # Save the current filename to the sftp commands file
+    # so the current file is deleted.
+    print FH1 "rm $Filename\n";
+
+  } # end foreach
+
+  # Add the last commands to the sftp commands file.
+  print FH1 "quit\n";
+  close FH1;
+
+  # Create the command to delete the files from the source server.
+  $CommandString = "sftp -b $SFTPCOMMANDSFILENAME " .
+                   "$SFTPUSERID\@$SFTPSERVER";
+
+  # Execute the command.
+  $Status = `$CommandString 2>/dev/null`;
+
+  # Delete the file with the sftp commands.
+  unlink $SFTPCOMMANDSFILENAME;
+
+  return;
+
+} # End DeleteNwsFilesOffSftpServer
+
+###############################################################################
+#
+#
+###############################################################################
+
+sub EmailListOfFiles {
+
+  my ( $MessageText ) = @_;
+
+  my ( $CommandString, $Status, $Subject, 
+     );
+
+  # Loop thru the list of email addresses.
+  $Subject = "Unprocessed NWS Files in Script $SCRIPTNAME";
+  foreach my $EmailAddress ( @EmailList ) {
+
+    # Send the message text to the requested address.
+    $CommandString = "echo \"$MessageText\" | " .
+                     "mailx -s \"$Subject\" " .
+                     "$EmailAddress";
+    $Status        = `$CommandString`;
+
+  } # end foreach
+
+  return;
+
+} # end EmailListOfFiles
+
+########################################################################
+#
+########################################################################
+
+sub LogEntry {
+
+  my ( $Message ) = @_;
+
+  my ( $DateTimeString,
+     );
+
+  # Open the log file for writing.
+  open( LFH, ">>$LOGFILENAME" );
+
+  # Determine the date/time and save the message to the log file.
+  $DateTimeString = `date '+%D %T'`;
+  chomp $DateTimeString;
+  print LFH "$DateTimeString - $Message\n";
+
+  # Close the log file.
+  close LFH;
+
+  return;
+
+} # End LogEntry
+
+########################################################################
+# 
+########################################################################
+
+sub Main {
+
+  my ( $CommandString, $Status, $FileCount,
+       $LocalFileStringString, $WorkFlow, $Fs1SearchString,
+       $TransformationString, $TotalFileCount,
+       $FewsSubdir, $LogMessage,
+       $FileList, $EmailMessage,
+     );
+
+  # Make sure the local temp directory exists.
+  unless ( -e $LOCALTEMPDIR ) {
+    mkdir $LOCALTEMPDIR;
+  }
+  # Make sure the local archive directory exists.
+  unless ( -e $LOCALARCHIVEDIR ) {
+    mkdir $LOCALARCHIVEDIR;
+  }
+
+  # Clear the local rename directory.
+  # Make sure the local rename directory exists.
+  unless ( -e $LOCALRENAMEDIR ) {
+    mkdir $LOCALRENAMEDIR;
+  }
+
+  # Clear the local temp directory.
+  $CommandString = "rm -f $LOCALTEMPDIR/*";
+  $Status = `$CommandString`;
+  $Status = 0;
+
+  # Copy all BSMH files from the sftp server.
+  CopyFilesFromSftpServer();
+
+  # Loop thru each of the NWS file types.
+  $TotalFileCount = 0;
+  foreach my $HashKey ( keys %NWSFILES ) {
+
+    # Extract the hash values.
+    $LocalFileStringString = $NWSFILES{$HashKey}[0];
+    $WorkFlow              = $NWSFILES{$HashKey}[1];
+    $Fs1SearchString       = $NWSFILES{$HashKey}[2];
+    $TransformationString  = $NWSFILES{$HashKey}[3];
+    $FewsSubdir            = $NWSFILES{$HashKey}[4];
+
+    # Determine if any files were copied to the temp directory.
+    $CommandString = "ls -1 $LOCALTEMPDIR 2>/dev/null | " .
+                     "$LocalFileStringString | wc -l";
+    $FileCount = `$CommandString`;
+
+    # Remove the carriage return and trim any blanks from the file count.
+    chomp $FileCount;
+    $FileCount = Trim( $FileCount );
+
+    # If the value of FileCount is greater than 0, files were transferred
+    # and the temp files transferred file needs to be created.
+    next unless ( $FileCount > 0 );
+
+    # If a positive value is returned, files were copied to the
+    # 4 FS1 servers and the associated workflows need to be executed.
+    if ( CopyFilesToFewsServer( $Fs1SearchString,
+                                $TransformationString,
+                                $FewsSubdir ) ) {
+ 
+      # Run the FEWS workflows on the 4 LDM servers.
+      RunWorkflows( $WorkFlow );
+
+      # Add the current file count to the running total.
+      $TotalFileCount += $FileCount;
+
+    } # end if
+
+  } # end foreach
+
+  # Delete the NWS grib files off chapsftp.  Only delete the
+  # files that were transferred to this server.  This check is
+  # necessary in case new files are transferred to chapsftp
+  # between the time files are copied to this server and when
+  # files are deleted off chapsftp.
+  DeleteNwsFilesOffSftpServer();
+
+  # Move all the files matching the various search strings to the
+  # archive directory.  This is necessary to find any unprocessed
+  # files.  This transfer must be done after ALL elements on the
+  # NWSFILES hash have been processed because some files are
+  # processed two time (either sent to two different directories
+  # or processed using two import processes).
+  foreach my $HashKey ( keys %NWSFILES ) {
+
+    # Extract the hash values.
+    $Fs1SearchString = $NWSFILES{$HashKey}[2];
+
+    # Move just the files matching the search string.
+    $CommandString = "mv $LOCALTEMPDIR/$Fs1SearchString " .
+                     "$LOCALARCHIVEDIR 2>/dev/null";
+    $Status        = `$CommandString`;
+
+  } # end foreach
+
+  # Determine if there are any files remaining in the local temp dir.
+  $CommandString = "ls -1 $LOCALTEMPDIR 2>/dev/null | wc -l";
+  $FileCount = `$CommandString`;
+
+  # Remove the carriage return and trim any blanks from the file count.
+  chomp $FileCount;
+  $FileCount = Trim( $FileCount );
+
+  # If the value of FileCount is greater than 0, send out email(s)
+  # listing the unprocessed files.
+  $LogMessage = "$TotalFileCount files copied to 4 FS1 servers";
+  if ( $FileCount > 0 ) {
+
+    # Create a list of unprocessed files for the email message.
+    $CommandString = "ls -1 $LOCALTEMPDIR/* 2>/dev/null";
+    $FileList      = `$CommandString`;
+
+    # Build the email message.
+    $EmailMessage = "The following NWS files were not processed\n" .
+                    "by the $SCRIPTNAME script:\n\n$FileList";
+
+    # Email the message to the list of users.
+    EmailListOfFiles( $EmailMessage );
+
+    # Include in the log file message the number of unprocessed
+    # files.
+    $LogMessage .= ", $FileCount files not processed.";
+
+    # Move all unprocessed files to the archive directory.
+    $CommandString = "mv $LOCALTEMPDIR/* $LOCALARCHIVEDIR";
+    $Status        = `$CommandString`;
+
+  } # end if
+
+  # Send a message to the log file.
+  LogEntry( $LogMessage );
+
+  return;
+
+} # End Main
+
+########################################################################
+# 
+########################################################################
+
+# Call the Main routine.
+Main();

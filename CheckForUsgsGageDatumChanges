@@ -1,0 +1,497 @@
+#!/usr/bin/perl -w
+#############################################################################
+#
+# File: /apps/rfc/system/bin/CheckForUsgsGageDatumChanges
+#
+# Purpose: Access the USGS stage/flow data on the web and if any datum values
+#          have changed, send an email to the designated addresses.
+#
+# Inputs:  /apps/rfc/system/data/CheckForUsgsGageDatumChanges.globalvalues
+#            This file contains the names of the script log file, USGS
+#            website for datum data, the email notification addresses,
+#            and the name of the input/out file containing the USGS gage
+#            ID and the previous value.
+#          /apps/rfc/system/data/CheckForUsgsGageDatumChanges.dat
+#            This file contain the complete list of USGS gages to check
+#            for datun changes and the last value.  Each time the script
+#            is run, this file is updated with the current values.
+#           
+# Outputs: /apps/rfc/system/data/CheckForUsgsGageDatumChanges.dat
+#            This file contain the complete list of USGS gages to check
+#            for datun changes and the last value.  Each time the script
+#            is run, this file is updated with the current values.
+#          Emails sent to addresses defined in the globalvalues file.
+#          Log file for status messages.
+#           
+# Developer: Mike McGee
+#
+# Updates:
+# 1.0  10/28/2015  mpm  Original code developed from getUsgsStageFlowData
+#                         off rvsprod.
+# 1.1  01/12/2017  mpm  Add the ssl_opts => {verify_hostname => 0} option
+#                         to the UserAgent creation.  This was needed when
+#                         USGS sites switched from http to https.
+#       
+#############################################################################
+
+# Include the team's perl library in the search path.
+use lib '/apps/rfc/system/lib';
+
+# Include any CPAN libraries that are used.
+use TvaGeneralRoutines;
+use Date::Calc qw(:all);
+use LWP::UserAgent;
+
+# All variables must be declared.
+use strict;
+
+# Determine and set the name of the script
+my $ScriptName = $0;
+
+# Define the name of the server running the script.
+my $ServerName = `uname -n`;
+
+# Hashs containing gage datums.
+my %GageDatums;
+
+# Array to hold comment lines.
+my @CommentLines;
+my $CommentLineCount = 0;
+
+# Declare the global arrays and hashes.
+# The following variables are defined in the file declared
+# in the ExternalDeclarationsFilename.
+our ( @NotificationList, @ErrorNotificationList,
+      $LogFileName, $InputOutputFilename,
+      $FromEmailAddress, $MaxChangeCount,
+      $GaugeDatumUrlPart1, $GaugeDatumUrlPart2,
+    );
+
+# Define the file with the external declarations.
+my $ExternalDeclarationsFilename = "/apps/rfc/system/data/" .
+                                   "CheckForUsgsGageDatumChanges." .
+                                   "globalvalues";
+
+##########################################################################
+#
+##########################################################################
+
+sub ReadExternalDeclarations {
+
+# Turn off strict type casing so the global variable names and values
+# can be set from the external file.
+no strict;
+
+  my ( @Values,
+       $ArrayOrHash, $ArrayName, $HashName, $NumberOfKeys,
+       $ArrayIndex,
+       $ColorName, $ColorCode1, $ColorCode2, $ColorCode3,
+       $VariableName, $VariableValue,
+     );
+
+  # Open the input file.
+  open( FH2, "<$ExternalDeclarationsFilename" );
+
+  # Process each line in the file.
+  $ArrayOrHash = "";
+  while ( my $Line = <FH2> ) {
+
+    # Remove any carriage returns and trim leading and trailing 
+    # blanks.
+    chomp $Line;
+    $Line = Trim( $Line );
+
+    # What to do with the current line.
+    if ( substr( $Line, 0, 1 ) eq "#" ) {
+
+      # Skip line beginning with pound sign.
+      next;
+
+    } elsif ( $Line eq "<ARRAY>" ) {
+
+      # Start of an array.
+      # Read the next line containing the array name.
+      $Line = <FH2>;
+      chomp $Line;
+      $ArrayName = $Line;
+      $ArrayOrHash = "ARRAY";
+      $ArrayIndex = 0;
+
+    } elsif ( $Line eq "<HASH>" ) {
+
+      # Start of an hash.
+      # Read the next line containing the hash name
+      # and the number of keys.
+      $Line = <FH2>;
+      chomp $Line;
+      ( $HashName, $NumberOfKeys ) = split /,/, $Line;
+      $ArrayOrHash = "HASH";
+
+    } elsif ( $Line eq "<VARIABLE>" ) {
+
+      # Start of a variable definition.
+      # Read the next line containing the variable name
+      # and value.
+      $Line = <FH2>;
+      chomp $Line;
+      ( $VariableName, $VariableValue ) = split /,/, $Line;
+      $$VariableName = $VariableValue;
+
+    } elsif ( $Line eq "</ARRAY>" || $Line eq "</HASH>" ||
+              $Line eq "</VARIABLE>" ) {
+
+      # End of an array or hash.
+      $ArrayOrHash = "";
+
+    } else {
+
+      # Process elements of an array or hash.
+      if ( $ArrayOrHash eq "ARRAY" ) {
+
+        # Process an array element.
+        @Values = split /,/, $Line;
+        ${$ArrayName}[$ArrayIndex++] = $Line;
+
+      } elsif ( $ArrayOrHash eq "HASH" ) {
+
+        # Process a hash element.
+        @Values = split /,/, $Line;
+        if ( $NumberOfKeys == 1 ) {
+          ${$HashName}{$Values[0]} = $Values[1];
+        } elsif ( $NumberOfKeys == 2 ) {
+          ${$HashName}{$Values[0]}{$Values[1]} = $Values[2];
+        } else {
+          ${$HashName}{$Values[0]}{$Values[1]}{$Values[2]} = $Values[3];
+        } # end if
+
+      } else {
+
+        # Unknown condition.
+        print "Unknown condition!!!\n" .
+              "Line is $Line\n" .
+              "ArrayOrHash = $ArrayOrHash\n";
+
+      } # end if
+
+    } # end if
+
+  } # end while
+
+  # Close the input file.
+  close FH2;
+
+# Turn the strict directive back on for the remainder of the program.
+use strict;
+
+  # Exit the sub.
+  return;
+
+} # end ReadExternalDeclarations
+
+
+########################################################################
+#
+# Read the file with the gage list, including the current datum value.
+#
+########################################################################
+
+sub ReadInputFile {
+
+  my ( $Line, $GageID, $GageDatum,
+     );
+
+  # Open the input file.
+  open( FH, "<$InputOutputFilename" );
+
+  # Read each linie in the file.
+  while ( $Line = <FH> ) {
+
+    # Remove any carriage returns and trim leading and trailing 
+    # blanks.
+    chomp $Line;
+    $Line = Trim( $Line );
+
+    # Save but don't process lines that start with a #.
+    if ( $Line =~ /^#/ ) {
+
+      # Save the current comment line in the array.
+      $CommentLines[$CommentLineCount++] = $Line;
+
+    } else {
+
+      # Process the current line.
+      ( $GageID, $GageDatum ) = split /,/, $Line;
+
+      # Remove any leading or trailing blanks.
+      $GageID = Trim( $GageID );
+      $GageDatum = Trim( $GageDatum );
+
+      # Save the gage ID and datum in the hash.
+      $GageDatums{$GageID} = $GageDatum;
+
+    } # end if
+
+  } # end while
+
+  # Close the input file.
+  close FH;
+
+  return;
+
+} # end ReadInputFile
+
+
+########################################################################
+#
+# Access the web page for each active USGS gauge.  If necessary,
+# extract and save the stage/flow data into the RvS database.
+#
+########################################################################
+
+sub AccessUsgsGageDatumData {
+
+  my ( $WebGageDatum, $WebUrl,
+       $UserAgent, $Request, $Response, $Content, $Bytes,
+       $EmailMessageText, $SubjectText, $ChangeCount,
+     );
+
+  # Create the user agent object to be used in the loop below.
+  $UserAgent = LWP::UserAgent->new( ssl_opts => {verify_hostname => 0} );
+
+  # Start with blank email message text.
+  $EmailMessageText = "";
+  $ChangeCount      = 0;
+
+  # Loop thru each USGS maintenanced gauge.
+  foreach my $GageID ( sort keys %GageDatums ) {
+
+    # Build the URL to access the web page with gage datum value
+    # for the current LCID.
+    $WebUrl = $GaugeDatumUrlPart1 . $GageID . $GaugeDatumUrlPart2;
+
+    # Access and save the gage datum.
+    $Request   = HTTP::Request->new( GET => "$WebUrl" );
+    $Response  = $UserAgent->request( $Request );
+    $Content   = $Response->content();
+    $Bytes     = length $Content;
+
+    # Find the line with the gage datum.
+    $WebGageDatum = "";
+    foreach my $Line ( split /\n/, $Content ) {
+
+      # Remove the trailing line feed.
+      chomp $Line;
+
+      # If the gage datum line is found, save the value.
+      if ( $Line =~ m/datum of gage/i ) {
+
+        # Extract the gage datum and remove any comma in the value.
+        ( $WebGageDatum ) = ( $Line =~ /^.+Datum of gage:\s+([\d\.,]+).+$/ );
+        $WebGageDatum =~ s/,//;
+        last;
+
+      } # end if
+
+    } # end foreach
+
+    # Determine if the gage datum was found for the current gage ID.
+    if ( $WebGageDatum eq "" ) {
+
+      # Add to the email message text.
+      $EmailMessageText .= "No gage datum could be found for gage " .
+                           "ID $GageID on web page $WebUrl\n\n";
+      $ChangeCount++;
+
+    } else {
+
+      # Determine if the gage datum has changed.
+      if ( abs( $WebGageDatum - $GageDatums{$GageID} ) > 0.001 ) {
+
+        # Add to the email message text.
+        $EmailMessageText .= "The gage datum value has changed " .
+                             "for ID $GageID.  The current value " .
+                             "is $GageDatums{$GageID} and the web " .
+                             "value is $WebGageDatum.\nThe web value " .
+                             "is found on web page $WebUrl\n\n";
+        $ChangeCount++;
+
+        SaveLogMsg( "Datum for gage $GageID change from " .
+                    "$GageDatums{$GageID} to $WebGageDatum\n" );
+
+        # Save the new datum value in the hash table.
+        $GageDatums{$GageID} = $WebGageDatum;
+
+      } # end if
+
+    } # end if
+
+  } # end foreach
+
+  # If there were datum changes, send an email to the notification
+  # list.  If there were a lot of changes, email the error list
+  # to have the problem investigated.
+  if ( $ChangeCount > 0 ) {
+
+    # Check for a lot of changes.
+    if ( $ChangeCount > $MaxChangeCount ) {
+
+      # Send an email to the error notification list.
+      $EmailMessageText = "Too many datum changes were found ($ChangeCount).\n" .
+                          "Please check the USGS web pages for issues before\n" .
+                          "rerunning this script ($ScriptName)\n";
+      $SubjectText = "Issue Running Script $ScriptName on server " .
+                     "$ServerName";
+
+      # Send an email to each error notifications email address.
+      foreach my $EmailAddress ( @ErrorNotificationList ) {
+        SendEmailMessage( $EmailAddress, $SubjectText, $EmailMessageText );
+      }
+
+    } else {
+
+      # Send the email message to the normal notification list.
+      $SubjectText = "New Gage Datums Detected Running Script $ScriptName " .
+                     "on server $ServerName";
+      foreach my $EmailAddress ( @NotificationList ) {
+        SendEmailMessage( $EmailAddress, $SubjectText, $EmailMessageText );
+      }
+
+    } # end if
+
+  } else {
+
+    # Save a log message that no gage datum changes were found.
+    SaveLogMsg( "No gage datum changes found.\n" );
+
+  } # end if
+
+  return;
+
+} # end AccessUsgsGageDatumData
+
+
+########################################################################
+#
+# Save the gage data and comment lines back to the input file.
+#
+########################################################################
+
+sub RewriteInputFile {
+
+  my ( $Line, $GageID, $GageDatum,
+     );
+
+  # Open the input file for writing.
+  open( FH, ">$InputOutputFilename" );
+
+  # Save the comment lines at the top.
+  for( my $i=0; $i<$CommentLineCount; $i++ ) {
+
+    # Save each comment line.
+    print FH "$CommentLines[$i]\n";
+
+  } # end for
+
+  # Save the current gage list and their associated datum value.
+  foreach my $GageID ( sort keys %GageDatums ) {
+
+    # Save the current gage ID and datum values.
+    print FH "$GageID, $GageDatums{$GageID}\n";
+
+  } # end foreach
+
+  # Close the output file.
+  close FH;
+
+  return;
+
+} # end RewriteInputFile
+
+
+########################################################################
+#
+# Save a message to the application log file
+#
+########################################################################
+
+sub SaveLogMsg  {
+
+  my ( $Msg ) = @_;
+
+  my ( $CurrentDateTime,
+     );
+
+  # Get the current date/time to timestamp the log msg.
+  $CurrentDateTime = CurrentTVADateTime( 3 );
+
+  # Save the message to the log file.
+  open( FILE, ">>$LogFileName" ) or 
+      die "Could not open log file $LogFileName\n";
+  print FILE "$CurrentDateTime: $Msg";
+  close FILE;
+
+  return;
+
+} # end SaveLogMsg
+
+
+########################################################################
+#
+#
+#
+########################################################################
+
+sub SendEmailMessage {
+
+  my ( $EmailAddress, $Subject, $MessageText ) = @_;
+
+  my ( $Text,
+     );
+
+  # Send the message text to the requested address.
+  open( MAIL, "|/bin/mail -t >> /dev/null" );
+  print MAIL << "EOF";
+To: $EmailAddress
+From: $FromEmailAddress
+Subject: $Subject
+
+$MessageText
+EOF
+
+  close MAIL;
+
+  return;
+
+} # end SendEmailMessage
+
+
+########################################################################
+#
+# Main procedure
+#
+########################################################################
+
+sub MainProcedure {
+
+  # Read the file with externally defined global variables.
+  ReadExternalDeclarations();
+
+  # Extract the list of active gages.
+  ReadInputFile();
+
+  # Access the USGS datum web page for each gage.
+  AccessUsgsGageDatumData();
+
+  # Save any gage IDs and datum values.
+  RewriteInputFile();
+
+}
+
+
+########################################################################
+#
+# Call the main procedure
+#
+########################################################################
+
+MainProcedure;

@@ -1,0 +1,310 @@
+#!/usr/bin/perl -w
+#
+#=========================================================================
+#
+# File: /apps/rfc/system/bin/MoveEdsDailyFiles
+#
+# Purpose: Copies nuclear EDS daily files from cegnet1 to the FEWS
+#            FS1 server.  First the script uses scp to copy the 
+#            individual hydrothermal files to the LDM server.  The
+#            files are then renamed and copied to the appropriate
+#            FS1 server using smbclient.  The script is run from 
+#            ldm's crontab at 6am each day.
+#
+# Inputs:  Files on the TVA cegnet1 server.  Files are located in the
+#            various plant directories (bf, sq, wb) with file names
+#            specific for each plant.
+#
+# Outputs: Renamed EDS files copied to the appropriate FS server.
+#
+# Developer: Mike McGee
+#
+# Updates:
+#  1.0  02/05/2015  mpm original code
+#  2.0  05/28/2015  mpm modify to use scp to copy files from cegnet1.
+#                         also use new FEWS naming convention for files
+#                         copied to FEWS FS server. also use the
+#                         encryption routines to retrieve samba password.
+#  3.0  02/17/2016  mpm switch to sftp to transfer files to FS1
+#  3.1  04/14/2016  mpm execute FEWS workflow after transferring files
+#  3.2  05/03/2016  mpm read database name from DetermineEnvironment app.
+#  3.3  06/14/2016  mpm execute python script to run FEWS workflow
+#  3.4  11/21/2016  mpm change cegnet1 domain to main.tva.gov
+#  4.0  03/15/2017  mpm  convert from sftp to smbclient for file xfers
+#                          to FEWS.
+#
+#=========================================================================
+#
+
+use lib '/apps/rfc/system/lib';
+
+# Specify perl modules to load.
+use TvaGeneralRoutines;
+use UserIdsWithEncryption;
+use Time::Local;
+use Date::Calc qw(:all);
+
+# All variables must be declared.
+use strict;
+
+# Determine the process ID of the script.
+my $PROCESSID = $$;
+
+# Determine operating environment.
+my $TempString = `/apps/rfc/system/bin/DetermineEnvironment`;
+my ( $SERVERTYPE, $FORECASTSHELLSERVER, $DBNAME ) = split /,/, $TempString;
+
+# Define the smbclient variables. The samba service name for
+# the FEWS FS1 server. All environments are the same except DEV.
+my $SMBUSERID;
+my $SMBUSERPASSWD;
+my $SMBWORKGROUP;
+GetKeyInfo( "FS1_$SERVERTYPE", \$SMBUSERID, \$SMBUSERPASSWD, \$SMBWORKGROUP );
+my $SMBCLIENTPROGRAM = "/usr/bin/smbclient";
+
+# Declare server directory where files will be copied.
+my $FEWSREMOTEDIR = "data/$DBNAME/Import/EDMR";
+
+# Define the work flow command to be run when new data is transferred.
+my $WORKFLOWCOMMAND = "/apps/rfc/system/bin/execute_workflow_linux.py " .
+                      "-workflow=ImportEDS";
+
+# Specify the EDS server name and login parameters.
+my $EDSSERVERNAME = "cegnet1.main.tva.gov";
+my $EDSSCPUSERID  = "ldm";
+
+# Directories where files will go on local server.
+my $LOCALTEMPDIR = "/tmp/edsdaily";
+
+# Define the log file.
+my $LOGFILENAME = "/apps/rfc/system/logs/MoveEdsDailyFiles.log";
+my $NUMBERFILESTRANSFERRED = 0;
+
+########################################################################
+#
+########################################################################
+
+sub CopyFilesFromEdsServer {
+
+  # Declare all variables used in the code.
+  my ( @MonthNames, @EdsFilenames, @FewsFilenamePrefix, @FileContents,
+       $CurrentYear, $CurrentMonth, $CurrentDay,
+       $ExtractYear, $ExtractMonth, $ExtractDay,
+       $EdsBaseFilename, $EdsFilename, $EdsServerDirectory,
+       $LocalFilename, $ProcessFile,
+       $Command, $Status, $DateTimeString, $LoopMax,
+     );
+
+  # Used for developing EDS filename.
+  @MonthNames = ( "jan", "feb", "mar", "apr", "may", "jun",
+                  "jul", "aug", "sep", "oct", "nov", "dec" );
+
+  # Define the individual filenames on the EDS server.
+  @EdsFilenames = ( 'bfn', 'sqn','wbn101', 'wbn103', 'wbn113a', 'wbn113b' );
+
+  # Define the FEWS filename prefix associated which each EDS filename.
+  @FewsFilenamePrefix = ( "HT_EDMR-BFN_EDS_", "HT_EDMR-SQN_EDS_",
+                          "HT_EDMR-WBN-101_EDS_", "HT_EDMR-WBN-103_EDS_",
+                          "HT_EDMR-WBN-113A_EDS_", "HT_EDMR-WBN-113B_EDS_" );
+
+  # Determine the current date.
+  ( $CurrentYear, $CurrentMonth, $CurrentDay ) = Today();
+
+  # If it's the first day of the month, extract the monthly
+  # file for the previous day.
+  if ( $CurrentDay > 1 ) {
+
+    # Extract data files for the current month.
+    $ExtractYear  = $CurrentYear;
+    $ExtractMonth = $CurrentMonth;
+    $ExtractDay   = $CurrentDay;
+
+  } else {
+  
+    # Extract data files for the previous month.
+    ( $ExtractYear, $ExtractMonth, $ExtractDay ) =
+      Add_Delta_Days( $CurrentYear, $CurrentMonth, $CurrentDay, -1 );
+  
+  }
+
+  # Determine the current date/time string for use in FEWS filenames.
+  $DateTimeString = CurrentTVADateTime( 5 );
+
+  # Loop for each EDS filename.
+  for ( my $Index = 0; $Index <= $#EdsFilenames; $Index++ ) {
+
+    # Set the current EDS base name.
+    $EdsBaseFilename = $EdsFilenames[$Index];
+
+    # Build the filename to look for on the EDS server.
+    # Format for the January EDS file is bfn.jan.
+    $EdsFilename = $EdsBaseFilename . '.' . $MonthNames[$ExtractMonth-1];
+
+    # Determine the EDS server directory.  It's the first two
+    # characters of the filename.
+    $EdsServerDirectory = substr( $EdsBaseFilename, 0, 2 );
+
+    # Build the name of the output file on the local server.
+    $LocalFilename = $FewsFilenamePrefix[$Index] .
+                     $DateTimeString . ".csv";
+ 
+    # Use scp to copy the current file to the local server.
+    $Command = "scp $EDSSCPUSERID\@$EDSSERVERNAME:$EdsServerDirectory/" .
+               "$EdsFilename $LOCALTEMPDIR/$LocalFilename";
+
+    # Execute the scp copy command.
+    $Status = `$Command`;
+
+    # Read the contents of the local file in the array FileContains.
+    open( FL2,"<$LOCALTEMPDIR/$LocalFilename" );
+    @FileContents = <FL2>;
+    close( FL2 );
+
+    # If the contains of the local file contains the string
+    # "No such file", error out for this site.
+    $ProcessFile = "YES";
+    $LoopMax = 10;
+    $LoopMax = $#FileContents if ( $#FileContents < $LoopMax );
+    for ( my $i = 0; $i < $LoopMax; $i++ ) {
+      if ( $FileContents[$i] =~/No such file/ ) {
+        select (STDOUT);
+        $ProcessFile  = "NO";
+        last;
+      } # end if
+    } # end for
+
+    # If the current file is valid, make necessary changes.
+    if ( $ProcessFile eq "YES" ) {
+
+      # Using the FileContains array, make the required
+      # modifications to the EDS file before it can be
+      # transferred to the FEWS server.
+      # Skip the first two lines in the file, header info.
+      open( FL3,">$LOCALTEMPDIR/$LocalFilename" );
+      print FL3 "# $FileContents[0]";
+      print FL3 "# $FileContents[1]";
+      for ( my $i=2; $i <= $#FileContents; $i++ ) {
+  
+        # Remove ALL whitespace from the current line.
+        $FileContents[$i] =~ s/\s//g;
+
+        # Append the year and month to each line.
+        print FL3 "$ExtractYear/$ExtractMonth/". 
+                  Trim( $FileContents[$i] ) . "\n";
+
+      } # end for
+    
+      # Increment the file counter.
+      $NUMBERFILESTRANSFERRED++;
+
+      # Close the output file.
+      close( FL3 );
+
+    } # end if
+
+  } # end for
+
+  return;
+
+} # end CopyFilesFromEdsServer
+
+
+########################################################################
+#
+########################################################################
+
+sub CopyFilesToFewsServer {
+
+  my ( $FewsServiceName, $CommandString, $Status,
+     );
+
+  # Determine the samba service name for the FEWS FS1 server.
+  # All environments are the same except DEV.
+  $FewsServiceName = "$FORECASTSHELLSERVER/Fews";
+  if ( $SERVERTYPE =~ "DEV" ) {
+    $FewsServiceName .= "_DEV";
+  } # end if
+
+  # Build the samba command to copy the file to FEWS.
+  $CommandString = "$SMBCLIENTPROGRAM //$FewsServiceName " .
+                   "-W $SMBWORKGROUP -U $SMBUSERID%$SMBUSERPASSWD " .
+                   "-c \"cd $FEWSREMOTEDIR; lcd $LOCALTEMPDIR; " .
+                   "prompt; mput *\"";
+  $Status = `$CommandString`;
+
+  return;
+
+} # end CopyFilesToFewsServer
+
+########################################################################
+#
+########################################################################
+
+sub LogEntry {
+
+  my ( $Message ) = @_;
+
+  my ( $DateTimeString,
+     );
+
+  # Open the log file for writing.
+  open( LFH, ">>$LOGFILENAME" );
+
+  # Determine the date/time and save the message to the log file.
+  $DateTimeString = CurrentTVADateTime( 5 );
+  print LFH "$DateTimeString - $Message\n";
+
+  # Close the log file.
+  close LFH;
+
+  return;
+
+} # End LogEntry
+
+########################################################################
+#
+########################################################################
+
+sub Main {
+
+  my ( $CommandString, $Status,
+     );
+
+  # Make sure the local temp directory exists.
+  unless ( -e $LOCALTEMPDIR ) {
+    mkdir $LOCALTEMPDIR;
+    chmod 0777, $LOCALTEMPDIR;
+  }
+
+  # Clear the local temp directory.
+  $CommandString = "rm -f $LOCALTEMPDIR/*";
+  $Status        = `$CommandString`;
+
+  # Copy the appropriate files from the EDS server to the local server.
+  CopyFilesFromEdsServer();
+
+  # If at least one file was copied from the EDS server,
+  # copy file to the FEWS FS server.
+  if ( $NUMBERFILESTRANSFERRED > 0 ) {
+
+    # Copy files to FS1.
+    CopyFilesToFewsServer();
+
+    # Execute the FEWS workflow to import the files.
+    $Status = `$WORKFLOWCOMMAND`;
+
+  } # end if
+
+  # Log the number of files transferred.
+  LogEntry( "$NUMBERFILESTRANSFERRED daily files copied from EDS to FEWS" );
+
+  return;
+
+} # End Main
+
+########################################################################
+#
+########################################################################
+
+# Call the Main routine.
+Main();

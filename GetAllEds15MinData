@@ -1,0 +1,499 @@
+#!/usr/bin/perl -w
+#===============================================================================
+#
+# File: /apps/rfc/system/bin/GetAllEds15MinData
+#
+# Purpose: Copies nuclear EDS ZENO_RESPONSE files on cegnet1.
+#          Data files are copied for all three nuclear plants.
+#          The script was written before samba was available on
+#          the Linux servers so it uses sftp to copy files to the
+#          FEWS FS servers.  Can be rewritten in the future to
+#          use smbclient for file copies to FEWS.
+#
+# Inputs:  Data files on the EDS server cegnet1.  
+#          Python script to execute FEWS workflow.
+#
+# Outputs: EDS files sent to FEWS.
+#          Log file for status messages.
+#
+# Developer: Mike McGee
+#
+# Updates:
+#  1.0  04/07/2015  mpm  original code
+#  1.1  05/21/2015  mpm  modify for new FEWS filename convention
+#  1.2  05/22/2015  mpm  use scp, instead of ftp, to transfer files from cegnet1
+#  1.3  08/12/2015  mpm  use encryption routines to determine samba login info
+#  2.0  02/17/2016  mpm  switch to sftp to transfer files to FS1
+#  2.1  04/14/2016  mpm  execute FEWS workflow after transferring files
+#  2.2  05/03/2016  mpm  read database name from DetermineEnvironment app.
+#  2.3  06/14/2016  mpm  execute python script to run FEWS workflow
+#  3.0  06/16/2016  mpm  collect and send zeno files from SQN and WBN
+#  3.1  10/13/2016  mpm  correct STAIONPOINTIDS hash for SQN and WBN
+#  3.2  11/21/2016  mpm  change cegnet1 domain to main.tva.gov
+#  4.0  03/02/2017  mpm  convert from sftp to smbclient for file xfers.
+#
+#===============================================================================
+#
+
+use lib '/apps/rfc/system/lib';
+
+# Load any required modules
+use TvaGeneralRoutines;
+use UserIdsWithEncryption;
+use Time::Local;
+use Date::Calc qw(:all);
+use File::Basename;
+
+# All variables must be declared.
+use strict;
+
+# Determine the process ID of the script.
+my $PROCESSID = $$;
+
+# Determine and set the name of the script
+my $SCRIPTNAME = basename( $0 );
+
+# Determine operating environment.
+my $TempString = `/apps/rfc/system/bin/DetermineEnvironment`;
+my ( $SERVERTYPE, $FORECASTSHELLSERVER, $DBNAME ) = split /,/, $TempString;
+
+# Define the smbclient variables. The samba service name for 
+# the FEWS FS1 server. All environments are the same except DEV.
+my $SMBUSERID;
+my $SMBUSERPASSWD;
+my $SMBWORKGROUP;
+GetKeyInfo( "FS1_$SERVERTYPE", \$SMBUSERID, \$SMBUSERPASSWD, \$SMBWORKGROUP );
+my $FEWSSERVICENAME = "$FORECASTSHELLSERVER/Fews";
+if ( $SERVERTYPE =~ "DEV" ) {
+  $FEWSSERVICENAME .= "_DEV";
+} # end if
+my $SMBCLIENTPROGRAM = "/usr/bin/smbclient";
+
+# Declare server directory where files will be copied.
+my $FEWSREMOTEDIR = "data/$DBNAME/Import/zeno";
+
+# Define the work flow command to be run when new data is transferred.
+my $WORKFLOWCOMMAND = "/apps/rfc/system/bin/execute_workflow_linux.py " .
+                      "-workflow=ImportZeno";
+
+# Specify information about the EDS server.
+my $EDSSERVERNAME    = "cegnet1.main.tva.gov";
+my $EDSFILEEXTENSION = "ZENO_RESPONSE";
+my $SCPUSERID        = "ldm";
+
+# Directory where files will go on local server.
+my $LOCALTEMPDIRECTORY = "/tmp/edszeno";
+my $LOCALTEMPFILEBASE  = "HT_Zeno_15Min_Cegnet";
+my $LOCALTEMPFILEEXT   = "csv";
+my $LOCALTEMPFILENAME  = "";
+
+# Define the log file.
+my $LOGFILENAME          = "/apps/rfc/system/logs/GetAllEds15MinData.log";
+
+# Global to save the number of ZENO files processed.
+my $NUMBERFILESPROCESSED = 0;
+
+# Define the month names on the EDS server.
+my @MONTHNAMES = ( "JAN", "FEB", "MAR", "APR", "MAY", "JUN",
+                   "JUL", "AUG", "SEP", "OCT", "NOV", "DEC" );
+
+# Define the hash that will hold the point IDs for each EDS station.
+my %STATIONNUMBERS  = ( 'bf' => [ 1, 4, 14, 16, 17, 18, 19 ],
+                        'sq' => [ 8, 12, 13, 14 ],
+                        'wb' => [ 30, 32, 40 ],
+                      );
+
+my %STATIONPOINTIDS = (
+     'bf' => [ [ "TP90","TP50","TP10","DEPTH_0.5","DEPTH_0.5-R","DEPTH_3.0","DEPTH_5.0",
+                 "DEPTH_7.0","DEPTH_545","DEPTH_535","DEPTH_535-R" ],
+
+               [ "TP90","TP50","TP10","DEPTH_0.5","DEPTH_3.0","DEPTH_5.0","DEPTH_7.0",
+                 "DEPTH_9.0","DEPTH_11.0","DEPTH_13.0","DEPTH_15.0","DEPTH_17.0",
+                 "DEPTH_20.0" ],
+
+               [ "TP90","TP50","TP10","DEPTH_0.5","DEPTH_3.0","DEPTH_5.0","DEPTH_7.0",
+                 "DEPTH_9.0","DEPTH_11.0","DEPTH_13.0","DEPTH_15.0","DEPTH_17.0",
+                 "DEPTH_20.0" ],
+
+               [ "TP90","TP50","TP10","DEPTH_0.5","DEPTH_0.5-R","DEPTH_3.0","DEPTH_5.0",
+                 "DEPTH_7.0","DEPTH_10.0","DEPTH_20.0","DEPTH_20.0-R" ],
+
+               [ "TP90","TP50","TP10","DEPTH_0.5","DEPTH_0.5-R","DEPTH_3.0","DEPTH_5.0",
+                 "DEPTH_7.0","DEPTH_10.0","DEPTH_20.0","DEPTH_20.0-R" ],
+
+               [ "TP90","TP50","TP10","#1_DIS_TEMP","#1_DIS_TEMP-R","#2_DIS_TEMP",
+                 "#2_DIS_TEMP-R","#3_DIS_TEMP","#3_DIS_TEMP-R" ],
+
+               [ "TP90","TP50","TP10","DEPTH_0.5","DEPTH_0.5-R","DEPTH_3.0","DEPTH_5.0",
+                 "DEPTH_7.0","DEPTH_545","DEPTH_535","DEPTH_535-R" ] ],
+
+     'sq' => [ [ "TP90","TP50","TP10","DEPTH_0.5","DEPTH_0.5-R","DEPTH_3.0","DEPTH_5.0",
+                 "DEPTH_7.0","DEPTH_673","DEPTH_671","DEPTH_667","DEPTH_656",
+                 "DEPTH_646","DEPTH_637","DEPTH_637-R" ],
+
+               [ "TP90","TP50","TP10","DIFFUS_1","DIFFUS_2","UNUSED","UNUSED",
+                 "UNUSED","UNUSED","UNUSED","UNUSED","UNUSED","UNUSED","UNUSED",
+                 "UNUSED","STAGE" ],
+
+               [ "TP90","TP50","TP10","DEPTH_0.5","DEPTH_0.5-R","DEPTH_3.0",
+                 "DEPTH_5.0","DEPTH_7.0","DEPTH_673","DEPTH_671","DEPTH_667",
+                 "DEPTH_656","DEPTH_646","DEPTH_637","DEPTH_637-R" ],
+
+               [ "TP90","TP50","TP10","DEPTH_0.5","DEPTH_0.5-R","DEPTH_3.0",
+                 "DEPTH_5.0", "DEPTH_7.0","DEPTH_9.0","DEPTH_11.0","DEPTH_15.0",
+                 "DEPTH_20.0", "DEPTH_25","DEPTH_30","DEPTH_30-R" ] ],
+
+     'wb' => [ [ "UPSTREAM_TP90","UPSTREAM_TP50","UPSTREAM_TP10","UPSTREAM_678",
+                 "UPSTREAM_677","UPSTREAM_676","UPSTREAM_675","UPSTREAM_674",
+                 "UPSTREAM_670","WATER_DEPTH_670" ],
+
+               [ "MRZ_TP90","MRZ_TP50","MRZ_TP10","MRZ_NORTH_TEMP","MRZ_NE_TEMP",
+                 "MRZ_SOUTH_TEMP","MRZ_SE_TEMP","EFF_DISC_TEMP","GLORY_HOLE_HEAD",
+                 "STATION33_3","STATION33_5","STATION33_7",
+                 "STATION34_3","STATION34_5","STATION34_7" ],
+
+               [ "LOW_VOL_WHP","CURRENT_LOOP_VOLTAGE" ] ],
+);
+
+# Define the number of days to go back and get files.
+my $DAYSTOGOBACK = 1;
+
+###############################################################################
+#
+# Verify that the temporary data file directory exists and is empty.
+#
+###############################################################################
+
+sub VerifyTempDirectory {
+
+  my ( $Command, $Status,
+     );
+
+  # If the local directory does not exist, create it.
+  unless ( -e $LOCALTEMPDIRECTORY ) {
+    mkdir $LOCALTEMPDIRECTORY;
+    chmod 0777, $LOCALTEMPDIRECTORY;
+  }
+
+  # Delete any files off the local directory.
+  $Command = "rm -f $LOCALTEMPDIRECTORY/*";
+  $Status = `$Command`;
+
+} # end VerifyTempDirectory
+
+###############################################################################
+#
+# Using scp, download BFN EDS files that end with the extension
+# ZENO_RESPONSE.  Always extract the files for the current and previous
+# days.  The EDS file with the previous day's data is renamed to 
+# EdsFile1.dat and EdsFile2.dat contains the current day's data.
+#
+###############################################################################
+
+sub GetFilesOffServerUsingScp {
+
+  my ( $SiteName ) = @_;
+
+  my ( $CurrentYear, $CurrentMonth, $CurrentDay,
+       $NewYear, $NewMonth, $NewDay,
+       $Command, $Status, $Counter, $PlantName,
+       $EdsFilename, $LocalFilename,
+     );
+
+  # Determine the current date.
+  ( $CurrentYear, $CurrentMonth, $CurrentDay) = Today();
+
+  # Define the plant name for the current site.
+  $PlantName = uc( $SiteName ) . "N";
+
+  # Loop thru the number of days to go back.
+  $Counter=1;
+  for ( my $i=0; $i<=$DAYSTOGOBACK; $i++ ) {
+
+    # Always extract data for the current working day.
+    ( $NewYear, $NewMonth, $NewDay ) =
+      Add_Delta_Days( $CurrentYear, $CurrentMonth, $CurrentDay, -$i );
+
+    # Build the filename for the working day.
+    $EdsFilename = "${NewDay}-$MONTHNAMES[$NewMonth-1]-" .
+                   "${NewYear}.${EDSFILEEXTENSION}";
+
+    # Build the local filename, W/O the file extension.
+    $LocalFilename = $PlantName . "_EdsFile" . $Counter;
+
+    # Build the command to use scp to copy the file.
+    $Command = "scp $SCPUSERID\@$EDSSERVERNAME:$SiteName/" .
+               "$EdsFilename $LOCALTEMPDIRECTORY/" .
+               $LocalFilename . ".tmp";
+
+    # Execute the command.
+    $Status = `$Command 2>/dev/null`;
+
+    # Build the command to remove the control-M at the end of each line.
+    $Command = "tr -d \'\\r\' < $LOCALTEMPDIRECTORY/$LocalFilename" .
+               ".tmp > $LOCALTEMPDIRECTORY/$LocalFilename" .
+               ".dat; rm $LOCALTEMPDIRECTORY/$LocalFilename" .
+               ".tmp";
+  
+    # Execute the command.
+    $Status = `$Command 2>/dev/null`;
+
+    # Increment the filename counter.
+    $Counter++;
+
+  } # end for
+
+  return;
+
+} # end GetFilesOffServerUsingScp
+
+###############################################################################
+#
+# Process all file transferred from the EDS server.
+#
+###############################################################################
+
+sub ProcessNewFiles {
+
+  my ( $SiteName ) = @_;
+
+  my ( @Values,
+       $Year, $Month, $Day, $Hour, $Minute, $Second,
+       $DateString, $TimeString, $CurrentDateTimeString,
+       $StationID, $TempID, $IndexIntoArrays, $ArrayRef,
+       $PlantName,
+     );
+
+  # Define the plant name for the current site.
+  $PlantName = uc( $SiteName ) . "N";
+
+  # Get the current date/time string.
+  $CurrentDateTimeString = CurrentTVADateTime( 5 );
+
+  # Open the temporary output file.
+  $LOCALTEMPFILENAME = "${LOCALTEMPFILEBASE}_${PlantName}_" .
+                       "${CurrentDateTimeString}.${LOCALTEMPFILEEXT}";
+
+  # Open the output file.
+  open( FH1, ">$LOCALTEMPDIRECTORY/$LOCALTEMPFILENAME");
+
+  # Process the files in the local temporary directory for the 
+  # specific site name passed to the routine.
+  while ( my $Filename = <$LOCALTEMPDIRECTORY/${PlantName}*.dat> ) {
+
+    # Open the current file and process the lines.
+    open( FH2, "<$Filename" );
+    $StationID = "";
+    while ( my $Line = <FH2> ) {
+
+      # Remove any line feeds and trim leading/trailing blanks.
+      chomp $Line;
+      $Line = Trim( $Line );
+
+      # Is this the start of a new station???
+      # New station data starts with 
+      # "  *####*" where #### is the station ID.
+      # Use a temporary variable to determine the new station ID
+      # so that a line that is not a new station ID does not 
+      # change the value of the last valid station ID.
+      if ( ( $TempID ) = ( $Line =~ m|\*(.*)\*| ) ) {
+
+        # Start of new station data.  Remove any leading
+        # zeros from the station ID.
+        $TempID =~ s/^0+//g;
+        $StationID = $TempID;
+        next;
+
+      } else {
+
+        # Skip blank lines.
+        next if ( $Line eq "" );
+
+        # Skip lines that start with a pound sign.
+        next if ( substr( $Line, 0, 1 ) eq "#" );
+
+        # Skip lines with less than 10 characters.
+        next if ( length( $Line ) <= 10 );
+
+        # Skip any lines with one of the error phrases in it.
+        # This indicates an error occurred creating the file on cegnet1.
+        next if ( $Line =~ m|Incorrect| || $Line =~ m|No_Response| ||
+                  $Line =~ m|Failed| );
+
+        # Process the line of data values for the current station ID.
+        # Each line of data consists of:
+        # <YY/MM/DD>,<HH:MM:SS>,reading values
+        # Split the current line by commas.
+        @Values = split /,/, $Line;
+
+        # Separate the date string.
+        ( $Year, $Month, $Day ) = split( '/', $Values[0] );
+        $Year += 2000;
+
+        # Separate the time string.
+        ( $Hour, $Minute, $Second ) = split( ':', $Values[1] );
+
+        # Build the date and time strings.
+        $DateString = sprintf "%02d/%02d/%04d", $Month, $Day, $Year;
+        $TimeString = sprintf "%02d:%02d:%02d", $Hour, $Minute, $Second;
+
+        # Define the array reference to the appropriate station
+        # numbers array in the STATIONNUMBERS hash.
+        $ArrayRef = $STATIONNUMBERS{$SiteName};
+
+        # Find the current station ID in the station numbers array.
+        $IndexIntoArrays = -1;
+        for ( my $i=0; $i<=$#{$ArrayRef}; $i++ ) {
+
+          # Check the station ID passed against the station IDs
+          # in the StationNumbers array.
+          if ( $StationID == $$ArrayRef[$i] ) {
+
+            # Save the current index and exit the loop.
+            $IndexIntoArrays = $i;
+            last;
+
+          } # end if
+      
+        } # end for
+
+        # If the IndexInfoArrays value is less than zero, the station ID
+        # was not found.  Abort the save.
+        if ( $IndexIntoArrays < 0 ) {
+
+          # Station ID not found.
+          print "Station ID $StationID not found in SaveDataToDatabase\n";
+          return;
+
+        } else {
+
+          # Save the individual values to the file that will be sent to FEWS.
+          $ArrayRef = $STATIONPOINTIDS{$SiteName}[$IndexIntoArrays];
+          for my $Index ( 0 .. $#{$ArrayRef} ) {
+
+            # Determine if the current value should be saved.
+            if ( $STATIONPOINTIDS{$SiteName}[$IndexIntoArrays][$Index] ne 'UNUSED' ) {
+
+              # Save the data to the temporary output file.
+              print FH1 "$Values[$Index+2], $StationID, " .
+                        "$STATIONPOINTIDS{$SiteName}[$IndexIntoArrays][$Index], " .
+                        "$DateString $TimeString\n";
+
+            } # end if
+
+          } # end for
+
+        } # end if
+
+      } # end if
+
+    } # end while
+
+    # Close the input file.
+    close FH2;
+
+    # Increment the counter for the number of files processed.
+    $NUMBERFILESPROCESSED++; 
+
+  } # end while
+
+  # Close the output file.
+  close FH1;
+
+  return;
+
+} # end ProcessNewFiles
+
+
+########################################################################
+#
+# Transfer the temporary EDS data file to the FEWS server.
+#
+########################################################################
+
+sub TransferFilesToFews {
+
+  my ( $CommandString, $Status,
+     );
+
+  # Build the samba command to copy the file to FEWS.
+  $CommandString = "$SMBCLIENTPROGRAM //$FEWSSERVICENAME " .
+                   "-W $SMBWORKGROUP -U $SMBUSERID%$SMBUSERPASSWD " .
+                   "-c \"cd $FEWSREMOTEDIR; " .
+                   "lcd $LOCALTEMPDIRECTORY; " .
+                   "prompt; mput *.$LOCALTEMPFILEEXT\"";
+  $Status = `$CommandString`;
+
+  return;
+
+} # end TransfersFileToFews
+
+########################################################################
+#
+########################################################################
+
+sub LogEntry {
+
+  my ( $Message ) = @_;
+
+  my ( $DateTimeString,
+     );
+
+  # Open the log file for writing.
+  open( LFH, ">>$LOGFILENAME" );
+
+  # Determine the date/time and save the message to the log file.
+  $DateTimeString = CurrentTVADateTime( 5 );
+  print LFH "$DateTimeString - $Message\n";
+
+  # Close the log file.
+  close LFH;
+
+  return;
+
+} # End LogEntry
+
+########################################################################
+#
+# Execute the routines to process new files.
+#
+########################################################################
+
+sub Main {
+
+  my ( $DateTimeString, $CommandString, $Status,
+     );
+
+  # Verify that the local directory exists.
+  VerifyTempDirectory();
+
+  # Loop thru each nuclear plant site.
+  foreach my $SiteName ( keys %STATIONPOINTIDS ) {
+
+    # Retrieve the current and previous days files off the EDS server.
+    GetFilesOffServerUsingScp( $SiteName );
+
+    # Process the files transferred from cegnet1.
+    ProcessNewFiles( $SiteName );
+
+  } # end foreach
+
+  # Transfer the temporary EDS data files to the FEWS server.
+  TransferFilesToFews();
+
+  # Execute the FEWS workflow to import the files.
+  $Status = `$WORKFLOWCOMMAND`;
+
+  # Log the number of files transferred.
+  LogEntry( "$NUMBERFILESPROCESSED zeno files processed and " .
+            "sent to FEWS" );
+
+} # end Main
+
+########################################################################
+#
+########################################################################
+
+# Call the Main routine.
+Main();
+

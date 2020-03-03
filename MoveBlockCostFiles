@@ -1,0 +1,474 @@
+#!/usr/bin/perl
+#=========================================================================
+#
+# File: /apps/rfc/system/bin/MoveBlockCostFiles
+#
+# Purpose: Script to move TRO block cost files from the FEWS PROD share.
+#          TRO copies their files to a single share on the FEWS PROD
+#          server. Unless the script is running in the PROD environment,
+#          it immediately aborts.  The PROD LDM server copies the 
+#          3 files to the 4 FEWS environments.  The price curve file
+#          is saved to the archive directory but not copied to FEWS.
+#          It is archived in case there is an issue with the TRO web
+#          service used to extract the price curve data.
+#
+# Inputs:  TRO data files copied to the ToRiverOps share on just the
+#            FEWS PROD environment.
+#
+# Outputs: TRO files sent to FEWS.
+#          Log file for status messages.
+#
+# Developer: Mike McGee
+#
+# Updates:
+#  1.0  08/24/2016  mpm  original code
+#  2.0  03/13/2017  mpm  convert from sftp to smbclient for file xfers.
+#                          also exclude the price curve file from xfer
+#                          to the FEWS servers.  price curve data is
+#                          extracted from TRO web service.
+#  2.1  03/14/2017  mpm  only copy files to the FEWS servers when they
+#                          change.  also run a second workflow when the
+#                          rvr file changes.
+#  2.2  03/16/2017  mpm  per Nathan, no longer necessary to run the 
+#                          second workflow.
+#
+#==###===================================================================
+
+use lib '/apps/rfc/system/lib';
+
+# Specify perl modules to load.
+use TvaGeneralRoutines;
+use UserIdsWithEncryption;
+use File::Basename;
+use File::Path;
+
+use strict;
+
+# Determine operating environment.
+my $TempString = `/apps/rfc/system/bin/DetermineEnvironment`;
+my ( $SERVERTYPE, $FORECASTSHELLSERVER, $DBNAME ) = split /,/, $TempString;
+
+# Exit unless running on the PROD server.
+exit unless ( $SERVERTYPE eq "PROD" );
+
+# Define the smbclient variables. The samba service name for
+# the FEWS FS1 server. All environments are the same except DEV.
+my $SMBUSERID;
+my $SMBUSERPASSWD;
+my $SMBWORKGROUP;
+GetKeyInfo( "FS1_$SERVERTYPE", \$SMBUSERID, \$SMBUSERPASSWD, \$SMBWORKGROUP );
+my $SMBCLIENTPROGRAM = "/usr/bin/smbclient";
+
+# Define the user ID for running ssh to execute the import scripts 
+# on the other LDM servers.
+my $SSHUSERID = "rvsldm";
+
+# Declare the FEWS directory where files will be copied.
+my $FEWSREMOTEDIRPART1 = "data";
+my $FEWSREMOTEDIRPART2 = "Import/TRO";
+
+# Define the FEWS work flow commands to be run when new data is transferred.
+# The second workflow is only run when the rvr file changes.
+my $WORKFLOWCOMMAND1 = "/apps/rfc/system/bin/execute_workflow_linux.py " .
+                       "-workflow=ImportTRO";
+#my $WORKFLOWCOMMAND2 = "/apps/rfc/system/bin/execute_workflow_linux.py " .
+#                       "-workflow=Publish_BlockCost_Report_Automatic";
+#my $RUNWORKFLOW2 = 0;
+
+# List of FEWS servers where files are copied.
+my @FEWSFS1SERVERLIST = ( "knxdwfewsfs1.main.tva.gov", 
+                          "chaawfewsfs1.main.tva.gov", 
+                          "knxpwfewsfs1.main.tva.gov", 
+                          "knxpwfewsfs2.main.tva.gov" 
+                        );
+
+# List of FEWS LDM servers where workflows are run using ssh.
+my @FEWSLDMSERVERLIST = ( "fewsldmd1.main.tva.gov",
+                          "fewsldma1.main.tva.gov",
+                          "fewsldmp1.main.tva.gov",
+                          "fewsldmp2.main.tva.gov",
+                        );
+
+# Define the names of the FEWS databases in the various environments.
+my @FEWSDBNAMELIST = ( "ustetvdmc00",
+                       "ustetvamc00",
+                       "ustetvpmc00",
+                       "ustetvpmc01"
+                     );
+                    
+# Define the source share server parameters.
+my $SOURCESERVICENAME = "$FORECASTSHELLSERVER/ToRiverOps";
+my $SOURCEDIRECTORY   = "/";
+
+# Define the file mask that are excluded from transfer to FEWS.
+my $EXCLUDEFILEMASK = "pricecurve";
+
+# Define the local temporary directory used to hold files.
+my $LOCALROOTDIR    = "/tmp/tro";
+my $LOCALTEMPDIR    = "$LOCALROOTDIR/temp";
+my $LOCALARCHIVEDIR = "$LOCALROOTDIR/archive";
+
+# Define the location and name of the log file.
+my $LOGFILENAME = "/apps/rfc/system/logs/MoveBlockCostFiles.log";
+
+# Set to 1 for debug printing, 0 otherwise.
+my $DEBUGFLAG = 0;
+
+# Set a flag to determine if system commands should be executed.
+my $EXECUTEFLAG = 1;
+
+########################################################################
+#
+########################################################################
+
+sub GetTroFilesFromServer {
+
+  my ( $Status, $CommandString,
+     );
+
+  # Create the command to copy all files from the PROD FS1 server.
+  # Once the new files are copied, they are deleted from the FS1
+  # server.
+  $CommandString = "$SMBCLIENTPROGRAM //$SOURCESERVICENAME " .
+                   "-W $SMBWORKGROUP -U $SMBUSERID%$SMBUSERPASSWD " .
+                   "-c \"lcd $LOCALTEMPDIR; cd $SOURCEDIRECTORY; " .
+                   "prompt; mget *; rm *\"";
+
+  # Execute the command.
+  if ( $EXECUTEFLAG ) { $Status = `$CommandString` };
+  if ( $DEBUGFLAG ) { print "CommandString is $CommandString\n" };
+
+  return;
+
+} # End GetTroFilesFromServer
+
+########################################################################
+#
+########################################################################
+
+sub NewFilesToTransfer {
+
+  my ( $CommandString, $Status,
+     );
+
+  # Issue the command to count the number of files
+  # in the temporary directory.
+  $CommandString = "ls -1 $LOCALTEMPDIR | wc -l";
+  $Status        = `$CommandString`;
+  chomp $Status;
+
+  if ( $DEBUGFLAG ) {
+    print "CommandString is $CommandString\n";
+    print "Status is $Status\n";
+  } # end if
+
+  return $Status;
+
+} # End NewFilesToTransfer
+
+########################################################################
+#
+########################################################################
+
+sub RemoveUnnecessaryFiles {
+
+  my ( @Parts,
+       $CommandString, $Status, $TempFilename,
+       $TestFilename, $Base, $Path, $Extension,
+     );
+
+  # Move any excluded files from the local temp directory
+  # to the archive directory.
+  while ( my $TempFilename = <$LOCALTEMPDIR/*> ) {
+
+    if ( $DEBUGFLAG ) { print "TempFilename is $TempFilename\n" };
+
+    # Does the current file match the excluded file mask.
+    if ( $TempFilename =~ /$EXCLUDEFILEMASK/ ) {
+
+      $CommandString = "mv $TempFilename $LOCALARCHIVEDIR";
+      if ( $EXECUTEFLAG) { $Status = `$CommandString` };
+      if ( $DEBUGFLAG ) { print "CommandString is $CommandString\n" };
+ 
+    } # end if
+
+  } # end while
+
+  # Search the remaining files and remove the ones that have not
+  # changed.
+  while ( my $TempFilename = <$LOCALTEMPDIR/*> ) {
+
+    # Break the filename into it components.
+    ( $Base, $Path, $Extension ) = fileparse( $TempFilename, '\..*' );
+
+    # Split the leading part of the name out of the filename.
+    # The split statement below will store into Parts[0] the
+    # part of the filename before the underscore followed by
+    # the date/time string.
+    @Parts = split( /[_]\d/, $Base );
+
+    # Build the name of the test file in the archive area.
+    $TestFilename = $Parts[0] . ".dat";
+    if ( $DEBUGFLAG ) { print "TestFilename is $TestFilename\n" };
+
+    # Verify that the file in the archive directory exists.  If
+    # not, set Status to a non-blank string so the file is
+    # processed.
+    if ( -e "$LOCALARCHIVEDIR/$TestFilename" ) {
+
+      # Compare the current file to the archived file.
+      $CommandString = "diff --brief $LOCALARCHIVEDIR/$TestFilename " .
+                       "$TempFilename";
+      $Status        = `$CommandString`;
+      if ( $DEBUGFLAG ) { print "CommandString is $CommandString\n" };
+      chomp $Status;
+      if ( $DEBUGFLAG ) { print "Status is $Status\n" };
+
+    } else {
+
+      # No file in the archive area so this file should be
+      # processed and saved.  Set Status to a non-blank string.
+      $Status = "ABCDEF";
+
+    } # end if
+
+    # If the length of the Status string is zero, the files are
+    # identical and the file does not need to be sent.
+    if ( length $Status == 0 ) {
+
+      $CommandString = "mv $TempFilename $LOCALARCHIVEDIR";
+      if ( $EXECUTEFLAG) { $Status = `$CommandString` };
+      if ( $DEBUGFLAG ) { print "CommandString is $CommandString\n" };
+  
+    } # end if
+
+  } # end while
+
+  return;
+
+} # End RemoveUnnecessaryFiles
+
+########################################################################
+#
+########################################################################
+
+sub CopyNewFilesToFews {
+
+  my ( $CommandString, $Status, $TempFilename, $FewsServiceName,
+     );
+
+  # Copy the remaining files to the four FEWS environments.
+  for ( my $i=0; $i<= $#FEWSFS1SERVERLIST; $i++ ) {
+
+    # Build the FEWS service name based on the name of the FS1
+    # server.
+    $FewsServiceName = "//$FEWSFS1SERVERLIST[$i]/Fews";
+    if ( $FEWSFS1SERVERLIST[$i] =~ "knxdw" ) {
+      $FewsServiceName .= "_DEV";
+    } # end if
+
+    # Build the samba command to copy the file to FEWS.
+    $CommandString = "$SMBCLIENTPROGRAM $FewsServiceName " .
+                     "-W $SMBWORKGROUP -U $SMBUSERID%$SMBUSERPASSWD " .
+                     "-c \"lcd $LOCALTEMPDIR/; " .
+                     "cd $FEWSREMOTEDIRPART1/$FEWSDBNAMELIST[$i]/" .
+                     "$FEWSREMOTEDIRPART2; prompt; mput *\"";
+
+    # Execute the command.
+    if ( $EXECUTEFLAG) { $Status = `$CommandString` };
+    if ( $DEBUGFLAG ) { print "CommandString is $CommandString\n" };
+
+  } # end for
+
+  return;
+
+} # End CopyNewFilesToFews
+
+########################################################################
+#
+########################################################################
+
+sub DeleteAndArchiveFiles {
+
+  my ( @Parts,
+       $CommandString, $Status,
+       $Filename, $Base, $Path, $Extension,
+       $TestFilename,
+     );
+
+  # Delete the new files off the incoming directory and move
+  # the new files to the archive directory.
+  while ( my $TempFilename = <$LOCALTEMPDIR/*> ) {
+
+    if ( $DEBUGFLAG ) { print "TempFilename is $TempFilename\n" };
+
+    # Break the filename into it components.
+    ( $Base, $Path, $Extension ) = fileparse( $TempFilename, '\..*' );
+
+    # Split the leading part of the name out of the filename.
+    # The split statement below will store into Parts[0] the
+    # part of the filename before the underscore followed by
+    # the date/time string.
+    @Parts = split( /[_]\d/, $Base );
+
+    # Build the name of the test file in the archive area.
+    $TestFilename = $Parts[0] . ".dat";
+
+    if ( $DEBUGFLAG ) { print "TestFilename is $TestFilename\n" };
+
+    # If the file still exists, it is a new file that needs to
+    # be copied to the archive directory w/o the date/time
+    # in the filename.  
+    $CommandString = "cp $TempFilename $LOCALARCHIVEDIR/$TestFilename";
+    if ( $EXECUTEFLAG ) { $Status  = `$CommandString` };
+    if ( $DEBUGFLAG ) { print "CommandString is $CommandString\n" };
+
+#    # The second workflow is only run if a new rvr_cost_data file
+#    # if sent.  Check the current file to determine if it's the
+#    # rvr_cost_data file.
+#    if ( $TestFilename =~ /rvr_cost_data/ ) {
+#      $RUNWORKFLOW2 = 1;
+#      if ( $DEBUGFLAG ) { print "Setting run workflow2 flag\n" };
+#    } # end if
+
+    # Move the current file to the archive directory.
+    $CommandString = "mv $TempFilename $LOCALARCHIVEDIR";
+    if ( $EXECUTEFLAG ) { $Status  = `$CommandString` };
+    if ( $DEBUGFLAG ) { print "CommandString is $CommandString\n" };
+
+  } # end while
+
+  return;
+
+} # End DeleteAndArchiveFiles
+
+########################################################################
+#
+########################################################################
+
+sub RunWorkflows {
+
+  my ( $CommandString, $Status, $TempFilename,
+     );
+
+  # Copy the remaining files to the four FEWS environments.
+  for ( my $i=0; $i<= $#FEWSLDMSERVERLIST; $i++ ) {
+
+    # Create the command to run workflow1 on the current server.
+    # Even if the current server is the one running this script,
+    # use the ssh command for consistency.
+    $CommandString = "ssh $SSHUSERID\@$FEWSLDMSERVERLIST[$i] " .
+                     "$WORKFLOWCOMMAND1";
+
+    # Execute the command.
+    if ( $EXECUTEFLAG) { $Status = `$CommandString` };
+    if ( $DEBUGFLAG ) { print "CommandString is $CommandString\n" };
+
+  } # end for
+
+#  # If a new rvr_cost_data file was sent, run the second 
+#  # workflow only on the current server (ie. PROD environment).
+#  if ( $RUNWORKFLOW2 ) {
+#    if ( $EXECUTEFLAG ) { $Status  = `$WORKFLOWCOMMAND2` };
+#    if ( $DEBUGFLAG ) { print "Running workflow 2 on local server\n" };
+#  } # end if
+
+  return;
+
+} # End RunWorkflows
+
+########################################################################
+#
+########################################################################
+
+sub LogEntry {
+
+  my ( $Message ) = @_;
+
+  my ( $DateTimeString,
+     );
+
+  # Open the log file for writing.
+  open( LFH, ">>$LOGFILENAME" );
+
+  # Determine the date/time and save the message to the log file.
+  $DateTimeString = CurrentTVADateTime( 7 );
+  print LFH "$DateTimeString - $Message\n";
+
+  # Close the log file.
+  close LFH;
+
+  return;
+
+} # End LogEntry
+
+########################################################################
+# 
+########################################################################
+
+sub Main {
+
+  my ( $CommandString, $Status, $FileCount, $TempFilename,
+     );
+
+  # Make sure the local temp and archive directories exists.
+  unless ( -e $LOCALROOTDIR ) {
+    mkdir $LOCALROOTDIR;
+  } # end unless
+  unless ( -e $LOCALTEMPDIR ) {
+    mkdir $LOCALTEMPDIR;
+  } # end unless
+  unless ( -e $LOCALARCHIVEDIR ) {
+    mkdir $LOCALARCHIVEDIR;
+  } # end unless
+
+  # Clear the local temp directory.
+  $CommandString = "rm $LOCALTEMPDIR/*";
+  if ( $EXECUTEFLAG ) { $Status  = `$CommandString` };
+  if ( $DEBUGFLAG ) { print "CommandString is $CommandString\n" };
+
+  # Copy all files from the PROD FS1 server.
+  GetTroFilesFromServer();
+
+  # Remove excluded files or files that are copies of files
+  # already sent to FEWS.
+  RemoveUnnecessaryFiles();
+
+  # Determine if files are different from the last
+  # files sent.
+  if ( NewFilesToTransfer() ) {
+
+    # Copy all files to the forecast shell.
+    CopyNewFilesToFews();
+
+    # Delete the files off the source and archive the transferred
+    # files.
+    DeleteAndArchiveFiles();
+
+    # If needed, run all import workflows.
+    RunWorkflows();
+
+    # Log a status message.
+    if ( $EXECUTEFLAG ) {
+      LogEntry( "New TRO block cost file(s) copied to FEWS" );
+    } # end if
+
+  } else {
+
+    # Log a status message.
+    if ( $EXECUTEFLAG ) {
+      LogEntry( "No new TRO files to copy to FEWS" );
+    } # end if
+
+  } # end if
+
+  return;
+
+} # End Main
+
+########################################################################
+# 
+########################################################################
+
+# Call the Main routine.
+Main();

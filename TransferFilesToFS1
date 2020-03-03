@@ -1,0 +1,337 @@
+#!/usr/bin/perl
+#=========================================================================
+# 
+# Script to transfer files from LDM directories
+# to forecast shell server.
+#
+# History
+#  1.0  07/16/2014  mpm Original script
+#  1.1  06/08/2015  mpm Modify the remote directory locations on FS1.
+#  1.2  08/12/2015  mpm use encryption routines to determine samba login info
+#  2.0  02/01/2016  mpm switch to sftp to transfer files to FS1
+#  2.1  03/31/2016  mpm add ability to run workflows on FS1 server
+#  2.2  05/03/2016  mpm read database name from DetermineEnvironment app.
+#  2.3  06/07/2016  mpm changed cheanup days from 3 to 1.  at 3 days, the 
+#                         archive directory holds 15GB+ of files.
+#  2.4  06/14/2016  mpm execute python script to run FEWS workflow
+#  3.0  02/27/2018  mpm  convert from sftp to smbclient for file xfers
+#                          to FEWS.
+#
+# Contacts
+#  Mike McGee  632-2134
+#
+#=========================================================================
+
+use lib '/apps/rfc/system/lib';
+
+# Specify perl modules to load.
+use TvaGeneralRoutines;
+use UserIdsWithEncryption;
+use File::Basename;
+use File::Path;
+
+# Force all variables to be defined.
+use strict;
+
+# Determine the process ID of the script.
+my $PROCESSID = $$;
+
+# Determine operating environment.
+my $TempString = `/apps/rfc/system/bin/DetermineEnvironment`;
+my ( $SERVERTYPE, $FORECASTSHELLSERVER, $DBNAME ) = split /,/, $TempString;
+
+# Define the smbclient variables. The samba service name for
+# the FEWS FS1 server. All environments are the same except DEV.
+my $SMBUSERID;
+my $SMBUSERPASSWD;
+my $SMBWORKGROUP;
+GetKeyInfo( "FS1_$SERVERTYPE", \$SMBUSERID, \$SMBUSERPASSWD, \$SMBWORKGROUP );
+my $FEWSSERVICENAME = "$FORECASTSHELLSERVER/Fews";
+if ( $SERVERTYPE =~ "DEV" ) {
+  $FEWSSERVICENAME .= "_DEV";
+} # end if
+my $SMBCLIENTPROGRAM = "/usr/bin/smbclient";
+
+# Declare server where files will be copied.
+my $FEWSREMOTEDIR = "data/$DBNAME/Import";
+
+# Define the hash with local and remote directories for xfers.
+my $LOCALSEARCHDIRECTORY = "/apps/rfc/system/ldmdata/import";
+my %DIRECTORIESHASH = ( "DukePower"            => "$FEWSREMOTEDIR/DukePower",
+                        "PaducahStage"         => "$FEWSREMOTEDIR/PaducahStage",
+                        "qpe"                  => "$FEWSREMOTEDIR/QPE/LMRFC",
+                        "qpf"                  => "$FEWSREMOTEDIR/QPF/MostLikely/LMRFC",
+                        "qpfc2max"             => "$FEWSREMOTEDIR/QPF/95Max/LMRFC",
+                        "qpfc2min"             => "$FEWSREMOTEDIR/QPF/05Min/LMRFC",
+                        "qpf16"                => "$FEWSREMOTEDIR/QPF/NAEFS/LMRFC",
+                        "qpfwpc"               => "$FEWSREMOTEDIR/QPF/MostLikely/WPC",
+                        "NMQ"                  => "$FEWSREMOTEDIR/QPE/MRMS",
+                        "riverForecasts/LMRFC" => "$FEWSREMOTEDIR/RiverForecasts/LMRFC",
+                        "riverForecasts/OHRFC" => "$FEWSREMOTEDIR/RiverForecasts/OHRFC",
+                        "USACE/Observed"       => "$FEWSREMOTEDIR/USACE",
+                        "USACE/Forecast"       => "$FEWSREMOTEDIR/USACE",
+                      );
+
+# Define the FEWS workflow(s) to run after transferring files to the FS server.
+my %WORKFLOWSHASH = ( "DukePower"              => [ "ImportDukeObserved", "ImportDukeForecast" ],
+                      "PaducahStage"           => [ "ImportPaducah" ],
+                      "qpe"                    => [ "ImportLMRFC_QPE" ],
+                      "qpf"                    => [ "ImportLMRFC_QPF" ],
+                      "qpfc2max"               => [ "ImportLMRFC_QPF" ],
+                      "qpfc2min"               => [ "ImportLMRFC_QPF" ],
+                      "qpf16"                  => [ "ImportLMRFC_QPF" ],
+                      "qpfwpc"                 => [ "ImportLMRFC_QPF" ],
+                      "NMQ"                    => [ "ImportMRMS" ],
+                      "riverForecasts/OHRFC"   => [ "ImportNWSForecasts" ],
+                      "riverForecasts/LMRFC"   => [ "ImportNWSForecasts" ],
+                      "USACE/Observed"         => [ "ImportCorps" ],
+                      "USACE/Forecast"         => [ "ImportCumberlandFlowsheet" ],
+                      );
+
+# Define the workflow command to be executed.
+my $WORKFLOWCOMMAND = "/apps/rfc/system/bin/execute_workflow_linux.py " .
+                      "-workflow=";
+
+# Define the archive directory where files are moved after
+# they are copied to the remote server.
+my $ARCHIVEDIRECTORY = "/apps/rfc/system/ldmdata/archive";
+
+# Define the temporary directory that will hold files to be copied
+# to FS1.
+my $TEMPDIRECTORY = "/tmp/TransferFilesToFS1";
+
+# Define the loaction of the log file.
+my $LOGFILENAME  = "/apps/rfc/system/logs/TransferFilesToFS1.log";
+
+#####################################################################
+#
+# Procedure for transferring files
+#
+#####################################################################
+
+sub TransferFiles {
+
+  my ( @TempArray,
+       $SearchDirName, $LocalDirName, $RemoteDirName,
+       $Base, $Path, $Extension, $FilesFound, $NoFilesFound,
+       $CommandString, $Status,
+     );
+
+  # Retrieve the name of the transfer directory to be searched.
+  if ( @ARGV < 1 ) {
+
+    # No search directory specified.  Assume that all directories
+    # should be searched for files to be transferred.
+    $SearchDirName = "ALL";
+
+  } else {
+
+    # Retrieve the search directory name.
+    $SearchDirName = $ARGV[0];
+
+  } # end if
+
+  # Verify that the search directory is a DirectoriesHash key.
+  unless ( exists $DIRECTORIESHASH{$SearchDirName} || $SearchDirName eq "ALL" ) {
+
+    # Search directory is not known, error condition.
+    print "The search directory name $SearchDirName " .
+          "is unknown!!!\n";
+    exit;
+
+  } # end unless
+
+  # Set the NoFilesFound variable to 0.  It will be used to
+  # determine if a log message is saved at the end of the sub.
+  $NoFilesFound = 1;
+
+  # Loop thru each directories looking for files to be transferred.
+  foreach my $HashKey ( keys %DIRECTORIESHASH ) {
+
+    # Skip the current directory named $HashKey unless it
+    # is equal to the search directory or the search directory
+    # is ALL.
+    next unless ( $SearchDirName eq $HashKey || $SearchDirName eq "ALL" );
+
+    # Transfer each file in the local directory.
+    $LocalDirName = "$LOCALSEARCHDIRECTORY/$HashKey";
+
+    # Make sure the temp directory starts out empty.
+    $CommandString = "rm $TEMPDIRECTORY/*";
+    $Status        = `$CommandString`;
+
+    # Loop thru the current directory copying files to the
+    # temp directory and moving files to the archive
+    # directory.  The FilesFound variable is used to 
+    # indicate that files were found in the current 
+    # search directory.
+    $FilesFound = 0;
+    while ( my $FileName = <$LocalDirName/*> ) {
+
+      # If this is the first file in the directory, reset
+      # the FileFound variable to true.
+      $FilesFound = 1 unless ( $FilesFound );
+
+      ( $Base, $Path, $Extension ) = fileparse( $FileName, '\..*' );
+
+      # Copy the current file to the temp area.
+      $CommandString = "cp $FileName $TEMPDIRECTORY";
+      $Status        = `$CommandString`;
+
+      # Move the current file to archive area.
+      $CommandString = "mv $FileName $ARCHIVEDIRECTORY\n";
+      $Status        = `$CommandString`;
+
+      # Log that the file was transferred.
+      LogEntry( "($HashKey) transferring file $Base$Extension" );
+
+    } # end while
+
+    # If the FilesFound variable is 1, then at least one
+    # file was found. Execute the appropriate work flow(s).
+    if ( $FilesFound ) {
+
+      # Build the samba command to copy the files from the temp
+      # directory to the appropriate directory on the FEWS
+      # FS1 server.
+      $CommandString = "$SMBCLIENTPROGRAM //$FEWSSERVICENAME " .
+                       "-W $SMBWORKGROUP -U $SMBUSERID%$SMBUSERPASSWD " .
+                       "-c \"lcd $TEMPDIRECTORY; " .
+                       "cd $DIRECTORIESHASH{$HashKey}; " .
+                       "prompt; mput *\"";
+      $Status        = `$CommandString`;
+
+      # Execute the python script to run the workflow(s) of
+      # the FEWS FS1 server.
+      # execute workflows on the FS server.
+      @TempArray = @{$WORKFLOWSHASH{$HashKey}};
+      for ( my $i=0; $i<=$#TempArray; $i++ ) {
+
+        # Build the command to run the appropriate workflow(s).
+        $CommandString = "${WORKFLOWCOMMAND}$WORKFLOWSHASH{$HashKey}[$i]";
+        $Status        = `$CommandString`;
+
+      } # end for
+
+    } # end if
+
+  } # end foreach
+
+  if ( $NoFilesFound ) {
+
+    # Log that no files were transferred.
+    LogEntry( "no files transferred" );
+
+  } # end if
+
+  # All data transferred and archived.
+  return;
+
+} # end TransferFiles
+
+#####################################################################
+#
+# Procedure for cleaning the archive directory.
+#
+#####################################################################
+
+sub CleanArchiveDirectory {
+
+  my ( $MaxAgeInDays, $MaxAgeInSeconds,
+       $CurrentDateInSeconds, $CreateDateInSeconds,
+       $FileAgeInSeconds, $FilesDeleted,
+     );
+
+  # Delete "old" files from the archive directory.
+  $MaxAgeInDays = 1;
+  $MaxAgeInSeconds = $MaxAgeInDays * 24 * 60 * 60;
+
+  # Determine the current date, in seconds.
+  $CurrentDateInSeconds = `date +%s`;
+
+  # Set the number of files deleted to zero.
+  $FilesDeleted = 0;
+  while ( my $FileName = <$ARCHIVEDIRECTORY/*> ) {
+
+    # Determine the file creation date.
+    $CreateDateInSeconds = (stat $FileName)[9];
+    $FileAgeInSeconds = $CurrentDateInSeconds-$CreateDateInSeconds;
+    # Determine if the file is too old.
+    if ( $FileAgeInSeconds > $MaxAgeInSeconds ) {
+
+      # Delete the old file.
+      unlink $FileName;
+      $FilesDeleted += 1;
+
+    } # end if
+
+  } # end while
+    
+  # Determine if any files were deleted from the archive directory.
+  # If so, save a message to the log file.
+  if ( $FilesDeleted > 0 ) {
+
+    # Log that the files cleaned from the archive directory.
+    LogEntry( "$FilesDeleted deleted from archive directory" );
+
+  } # end if
+ 
+} # end CleanArchiveDirectory
+
+########################################################################
+#
+########################################################################
+
+sub LogEntry {
+
+  my ( $Message ) = @_;
+
+  my ( $DateTimeString,
+     );
+
+  # Open the log file for writing.
+  open( LFH, ">>$LOGFILENAME" );
+
+  # Determine the date/time and save the message to the log file.
+  $DateTimeString = `date '+%D %T'`;
+  chomp $DateTimeString;
+  print LFH "$DateTimeString - $Message\n";
+
+  # Close the log file.
+  close LFH;
+
+  return;
+
+} # End LogEntry
+
+########################################################################
+#
+########################################################################
+
+sub Main {
+
+  # Make sure the archive directory exists.
+  unless ( -e $ARCHIVEDIRECTORY ) {
+    mkdir $ARCHIVEDIRECTORY;
+  } # end unless
+
+  # Make sure the temp directory exists.
+  unless ( -e $TEMPDIRECTORY ) {
+    mkdir $TEMPDIRECTORY;
+  } # end unless
+
+  # Transfer files to the forecast shell server.
+  TransferFiles();
+
+  # Delete "old" files in the archive area.
+  CleanArchiveDirectory();
+
+} # End Main
+
+########################################################################
+#
+########################################################################
+
+# Call the Main routine.
+Main();
+

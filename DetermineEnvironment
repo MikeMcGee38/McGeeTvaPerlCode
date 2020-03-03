@@ -1,0 +1,88 @@
+#!/usr/bin/perl
+#=============================================================================
+#
+# File: /apps/rfc/system/bin/DetermineEnvironment
+#
+# Purpose: Determine on which environment the script is running
+#          (DEV, ACCP, PROD, BACKUP). This script is called by other
+#          programs to determine which FEWS Windows environment
+#          it is running under and send back the name of the FS
+#          server, database name and environment type.
+#
+# Inputs:  None
+#
+# Outputs: System return a comma separated string with the following
+#          information: enviroment type, FS server for environment,
+#          database name for environment.  There is NO carriage 
+#          return at the end of the returned string.
+#
+# Developer: Mike McGee
+#
+# Updates:
+# 1.0  02/01/2017  mpm  Original code.
+#
+#=============================================================================
+
+use lib '/apps/rfc/system/lib';
+
+use strict;
+
+my ( $ProdLdmServerName, $DrLdmServerName, $AccpLdmServerName,
+     $ProdFsServerName, $DrFsServerName, $AccpFsServerName, $DevFsServerName,
+     $ProdDatabaseName, $DrDatabaseName, $AccpDatabaseName, $DevDatabaseName,
+     $CurrentServerName, $EnvironmentState, $FsServerName, $DbName,
+   );
+
+# Define the PROD, backup PROD and ACCP LDM server names.
+$ProdLdmServerName = "fewsldmp1";
+$DrLdmServerName   = "fewsldmp2";
+$AccpLdmServerName = "fewsldma1";
+
+# Define the names of the PROD, backup PROD, ACCP and DEV FS servers.
+$ProdFsServerName = "knxpwfewsfs1";
+$DrFsServerName   = "knxpwfewsfs2";
+$AccpFsServerName = "chaawfewsfs1";
+$DevFsServerName  = "knxdwfewsfs1";
+
+# Define the database names.
+$ProdDatabaseName = "ustetvpmc00";
+$DrDatabaseName   = "ustetvpmc01";
+$AccpDatabaseName = "ustetvamc00";
+$DevDatabaseName  = "ustetvdmc00";
+
+# Determine the name of the server running the script.
+$CurrentServerName = `uname -n`;
+
+# Assume the script is running in the DEV environment
+# unless the server name matches the ACCP, PROD or
+# backup server names.
+$EnvironmentState = "DEV";
+$FsServerName     = $DevFsServerName;
+$DbName           = $DevDatabaseName;
+if ( $CurrentServerName =~ $ProdLdmServerName ) {
+
+  # Running on the PROD server.
+  $EnvironmentState = "PROD";
+  $FsServerName     = $ProdFsServerName;
+  $DbName           = $ProdDatabaseName;
+
+} elsif ( $CurrentServerName =~ $DrLdmServerName ) {
+
+  # Running on the backup PROD server.
+  $EnvironmentState = "DR";
+  $FsServerName     = $DrFsServerName;
+  $DbName           = $DrDatabaseName;
+
+} elsif ( $CurrentServerName =~ $AccpLdmServerName ) {
+
+  # Running on the ACCP server.
+  $EnvironmentState = "ACCP";
+  $FsServerName     = $AccpFsServerName;
+  $DbName           = $AccpDatabaseName;
+
+} # end if
+
+# Echo to the calling program the server environment.
+print "$EnvironmentState,$FsServerName,$DbName";
+
+exit;

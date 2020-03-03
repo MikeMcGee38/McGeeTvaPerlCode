@@ -1,0 +1,373 @@
+#!/usr/bin/perl
+#=========================================================================
+#
+# File: /apps/rfc/system/bin/deleteOldDrotFiles
+#
+# Purpose: Script will delete old DROT transaction files off the
+#          DROT servers.  Files being deleted are in the
+#          TransactionFilesBackup folder on the servers.  These
+#          files are only there in case of issues with the 
+#          transaction files in the four normal folders on the 
+#          two DROT servers.  Since there are only two backup
+#          folders, the script is only run on the PROD LDM server
+#          to delete files on knxpdrot and on DEV to delete the
+#          files on chapdrot.
+#
+# Inputs:  Files on the two DROT servers under the backup folders.
+#
+# Outputs: Scripts log file.
+#
+# Developer: Mike McGee
+#
+# Updates:
+# 1.0  04/05/2017  mpm  original version
+#
+#=====================================================================
+
+use lib '/apps/rfc/system/lib';
+
+# Specify perl modules to load.
+use TvaGeneralRoutines;
+use UserIdsWithEncryption;
+use File::Basename;
+use File::Path;
+use Date::Calc qw(:all);
+
+use strict;
+
+# Determine the process ID of the script.
+my $PROCESSID = $$;
+
+# Determine and set the name of the script
+my $SCRIPTNAME = basename( $0 );
+
+# Determine operating environment.
+my $TempString = `/apps/rfc/system/bin/DetermineEnvironment`;
+my ( $SERVERTYPE, $FORECASTSHELLSERVER, $DBNAME ) = split /,/, $TempString;
+
+# Abort the script if not running on DEV or PROD server.
+exit unless ( $SERVERTYPE =~ m/PROD/ || $SERVERTYPE =~ m/DEV/ );
+
+# Define the loction of the samba client software.
+my $SMBCLIENTPROGRAM = "/usr/bin/smbclient";
+
+# Define the smbclient variables for the DROT servers.
+my $DROTUSERID;
+my $DROTUSERPASSWD;
+my $DROTWORKGROUP;
+GetKeyInfo( "DROT_$SERVERTYPE", \$DROTUSERID, \$DROTUSERPASSWD, \$DROTWORKGROUP );
+
+# Define DROT specific variables.
+my $DROTSERVER;
+if ( $SERVERTYPE =~ /PROD/ ) {
+  # Production definitions
+  $DROTSERVER = "knxpdrot";
+} else {
+  # Development definitions
+  $DROTSERVER = "chapdrot";
+} # end if
+my $DROTSERVICENAME   = "//$DROTSERVER/DROT";
+my $DROTWORKGROUP     = "tva";
+my $DROTDIRECTORYNAME = "TransactionFilesBackup";
+
+# Define the log file, it's location and the file handle.
+my $LOGFILENAME    = "/apps/rfc/system/logs/DeleteOldDrotFiles.log";
+my $MAXLOGFILESIZE = 500000;
+
+# Set the maximum number of days a file is saved before deletion.
+my $MAXFILESAVEDAYS = 2;
+
+# Define the test mode flag.  If set to 1, then files are not deleted.
+my $TESTMODE = 0;
+
+# Set the debug printing level.
+# 0 - no debug printing
+# 1 - status logging to log file
+# 2 - debug printing to log file
+# 3 - debug printing to screen
+my $DEBUGPRINTING = 1;
+
+########################################################################
+#
+########################################################################
+
+sub OpenLogFile {
+
+  my ( @FileInfo,
+       $Command, $Status,
+     );
+
+  # Determine if the log file needs to be rolled.
+  if ( -e "$LOGFILENAME" ) {
+
+    # The log file already exists.  Determine if the size
+    # of the file requires it to be rolled.
+    @FileInfo = stat "$LOGFILENAME";
+    if ( $FileInfo[7] > $MAXLOGFILESIZE ) {
+      $Command = "mv $LOGFILENAME $LOGFILENAME.old";
+      $Status = `$Command`;
+      $Command = "touch $LOGFILENAME";
+      $Status = `$Command`;
+    }
+  } else {
+    # The log file does not exist.
+    $Command = "touch $LOGFILENAME";
+    $Status = `$Command`;
+  } # end if
+
+  # Open the log file for writing.
+  open( LFH, ">>$LOGFILENAME" );
+
+  return;
+
+} # End OpenLogFile
+
+########################################################################
+#
+########################################################################
+
+sub IsDrotServerUp {
+
+  my ( $DrotServerName ) = @_;
+
+  my ( $Count, $Command,
+     );
+
+  if ( $DEBUGPRINTING == 3 ) {
+    print CurrentTVADateTime(7), " - determining if the drot " .
+          "is running\n";
+  } elsif ( $DEBUGPRINTING == 2 ) {
+    print LFH CurrentTVADateTime(7), " - determining if the drot " .
+              "is running\n";
+  } # end if
+
+  # Using the ping command, determine if the drot server is alive.
+  $Command = "/usr/sbin/ping $DrotServerName | grep alive | wc -l";
+
+  # Issue the command which should return one if the server is up.
+  $Count = `$Command`;
+
+  # Return zero if the count is zero.
+  if ( $Count == 0 ) {
+    # Drot server unavailable.
+    return 0;
+  } else {
+    # Drot server up.
+    return 1;
+  } # end if
+
+} # End IsDrotServerUp
+
+########################################################################
+#
+########################################################################
+
+sub CheckFilesOnDrot {
+
+  my ( @Lines, @Parts, @FilesToDelete,
+       $Command,
+       $CurYear, $CurMonth, $CurDay, $CurAbsDays,
+       $FileYear, $FileMonth, $FileDay, $AbsFileDays,
+       $FilesToDeleteCounter, $Subject, $Message,
+     );
+
+  if ( $DEBUGPRINTING == 3 ) {
+    print CurrentTVADateTime(7), " - checking files on drot " .
+          "server $DROTSERVER, directory $DROTDIRECTORYNAME\n";
+  } elsif ( $DEBUGPRINTING == 2 ) {
+    print LFH CurrentTVADateTime(7), " - checking files on drot " .
+              "server $DROTSERVER, directory $DROTDIRECTORYNAME\n";
+  } # end if
+
+  # Determine the current date.
+  ( $CurYear, $CurMonth, $CurDay ) = Today();
+  $CurAbsDays = Date_to_Days( $CurYear, $CurMonth, $CurDay );
+
+  # Create the command to copy the transaction files.
+  $Command = "$SMBCLIENTPROGRAM $DROTSERVICENAME " .
+             "-U $DROTUSERID\%$DROTUSERPASSWD " .
+             "-W $DROTWORKGROUP " .
+             "-c \"cd $DROTDIRECTORYNAME; dir\"";
+
+  if ( $DEBUGPRINTING == 3 ) {
+    print CurrentTVADateTime(7), " - $Command\n";
+  } elsif ( $DEBUGPRINTING == 2 ) {
+    print LFH CurrentTVADateTime(7), " - $Command\n";
+  } # end if
+
+  # Execute the command.
+  @Lines = `$Command`;
+
+  # Determine if the transaction files directory was found.
+  return if ( $Lines[0] =~ m/NOT_FOUND/i );
+
+  if ( $DEBUGPRINTING == 3 ) {
+    print CurrentTVADateTime(7), " - found $#Lines files on " .
+          "server\n";
+  } elsif ( $DEBUGPRINTING == 1 || $DEBUGPRINTING == 2 ) {
+    print LFH CurrentTVADateTime(7), " - found $#Lines files on " .
+              "server\n";
+  } # end if
+
+  # Set the array counter to zero.
+  $FilesToDeleteCounter = 0;
+
+  # Find all the valid filenames.
+  foreach my $Line ( @Lines ) {
+
+    # Trim the line before processing starts.
+    $Line = Trim( $Line );
+
+    # Split the line on spaces.
+    @Parts = split( " ", $Line );
+
+    # Ignore the . and .. files.
+    next if ( $Parts[0] eq "." || $Parts[0] eq ".." );
+
+    # Filename must be in the form GGGG-YYYYMMDDHHmmSS.
+    next if ( length( $Parts[0] ) != 19 );
+
+    # Determine the year, month and day from the filename.
+    $FileYear  = substr( $Parts[0],  5, 4 );
+    $FileMonth = substr( $Parts[0],  9, 2 );
+    $FileDay   = substr( $Parts[0], 11, 2 );
+
+    # Determine the absolute dadays date of the file.
+    $AbsFileDays = Date_to_Days( $FileYear, $FileMonth, $FileDay );
+
+    # Determine if the file should be added to the delete list.
+    if ( ( $CurAbsDays - $AbsFileDays ) > $MAXFILESAVEDAYS ) {
+      $FilesToDelete[$FilesToDeleteCounter++] = $Parts[0];
+    } # end if
+
+  } # end foreach
+
+  # If FilesToDeleteCounter is greater than zero,
+  # process the files in the FileToDelete array.
+  if ( $FilesToDeleteCounter > 0 && $TESTMODE != 1 ) {
+    DeleteFilesOffDrot( \@FilesToDelete, $FilesToDeleteCounter );
+  } # end if
+
+  return;
+
+} # End CheckFilesOnDrot
+
+########################################################################
+#
+########################################################################
+
+sub DeleteFilesOffDrot {
+
+  my ( $FilenamesArrayRef, $Counter ) = @_;
+
+  my ( $Count, $FileList, $Command, $Status, $MaxDeletesInCommand,
+     );
+
+  if ( $DEBUGPRINTING == 3 ) {
+    print CurrentTVADateTime(7), " - deleting $Counter " .
+          "transaction files off DROT server $DROTSERVER, " .
+          "directory $DROTDIRECTORYNAME\n";
+  } elsif ( $DEBUGPRINTING == 1 ) {
+    print LFH CurrentTVADateTime(7), " - deleting $Counter " .
+              "transaction files off DROT server $DROTSERVER, " .
+              "directory $DROTDIRECTORYNAME\n";
+  } # end if
+
+  # Start the loop to delete the processed transaction files
+  # off the DROT server.
+  $Count = 0;
+  $FileList = "";
+  $MaxDeletesInCommand = 10;
+  for( my $Index = 0; $Index < $Counter; $Index ) {
+
+    $FileList .= "rm $$FilenamesArrayRef[$Index];";
+    $Count++;
+    if ( $Count >=  $MaxDeletesInCommand ) {
+
+      # Delete the list of files off the drot server.
+      $Command = "$SMBCLIENTPROGRAM $DROTSERVICENAME " .
+                 "-U $DROTUSERID\%$DROTUSERPASSWD " .
+                 "-W $DROTWORKGROUP " .
+                 "-c \"cd $DROTDIRECTORYNAME; $FileList\"";
+
+      if ( $DEBUGPRINTING == 3 ) {
+        print CurrentTVADateTime(7), " - $Command\n";
+      }elsif ( $DEBUGPRINTING == 2 ) {
+        print LFH CurrentTVADateTime(7), " - $Command\n";
+      } # end if
+
+      # Execute the command.
+      $Status = `$Command`;
+
+      $Count = 0;
+      $FileList = "";
+
+    } # end if
+    $Index++;
+  } # end for
+
+  # Delete any remaining files in the file list.
+  if ( $Count > 0 ) {
+
+    # Delete the list of files off the drot server.
+    $Command = "$SMBCLIENTPROGRAM $DROTSERVICENAME " .
+               "-U $DROTUSERID\%$DROTUSERPASSWD " .
+               "-W $DROTWORKGROUP " .
+               "-c \"cd $DROTDIRECTORYNAME; $FileList\"";
+
+    if ( $DEBUGPRINTING == 3 ) {
+      print CurrentTVADateTime(7), " - $Command\n";
+    }elsif ( $DEBUGPRINTING == 2 ) {
+      print LFH CurrentTVADateTime(7), " - $Command\n";
+    } # end if
+
+    # Execute the command.
+    $Status = `$Command`;
+
+  } # end if
+
+  return;
+
+} # End DeleteFilesOffDrot
+
+########################################################################
+# 
+########################################################################
+
+sub Main {
+
+  my ( $ServerName, $DirName,
+       $Subject, $Message,
+     );
+
+  # Open the log file.
+  OpenLogFile();
+
+  if ( $DEBUGPRINTING == 3 ) {
+    print CurrentTVADateTime(7), " - script started\n";
+  }elsif ( $DEBUGPRINTING == 1 || $DEBUGPRINTING == 2 ) {
+    print LFH CurrentTVADateTime(7), " - script started\n";
+  } # end if
+
+  # Check the appropriate server for old files.
+  CheckFilesOnDrot();
+
+  if ( $DEBUGPRINTING == 3 ) {
+    print CurrentTVADateTime(7), " - script completed\n";
+  } elsif ( $DEBUGPRINTING == 1 || $DEBUGPRINTING == 2 ) {
+    print LFH CurrentTVADateTime(7), " - script completed\n";
+  } # end if
+
+  # Close the log file.
+  close LFH;
+
+  return;
+
+} # End Main
+
+########################################################################
+# 
+########################################################################
+
+# Call the Main routine.
+Main();

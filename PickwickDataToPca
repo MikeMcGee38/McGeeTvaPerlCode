@@ -1,0 +1,352 @@
+#!/usr/bin/perl -w
+###############################################################################
+#
+# Script: /apps/rfc/system/bin/PickwickDataToPca
+# Author: Mike McGee
+# Revisions:  20160712  mpm  Convert to run on FEWS servers.
+# 
+# This script is run by cron to extract pickwick flow and power values.
+# A temporary file is created and ftp'ed to info.tva.gov.  PCA is 
+# responsible for getting the file off info.tva.gov.
+#
+###############################################################################
+
+# Load any required modules
+use strict;
+use Socket;
+
+# Determine operating environment.
+my $TempString = `/apps/rfc/system/bin/DetermineEnvironment`;
+my ( $SERVERTYPE, $FORECASTSHELLSERVER, $DBNAME ) = split /,/, $TempString;
+
+# Abort the script if not running on the production server.
+exit if ( $SERVERTYPE !~ /PROD/ );
+
+# Determine the script name and process ID.
+my $SCRIPTNAME = $0;
+my $PROCESSID  = $$;
+
+# $TmpDataFile: the temporary data file holding the current flow and
+#               power at pickwick.  This file is created, ftp'ed to
+#               info.tva.gov then deleted.
+my $TmpDataFile = '/tmp/pickwick.pca';
+
+# Info about the secure host.
+my $SECUREHOSTNAME = "chapsftp.tva.gov";
+my $SECUREUSERNAME = "rvspca";
+my $SFTPBATCHFILE  = "/apps/rfc/system/data/sftp_cmd6.bat";
+
+# Define the email address to receive error messages.
+my $ERROREMAILADDRESS = "mpmcgee\@tva.gov";
+
+# the remote servers IP address and the port it 'listens' to
+my $REMOTEHOST = "";
+my $REMOREPORT = "";
+GetHostInfo( 'KNXWVSERVER', \$REMOTEHOST, \$REMOREPORT );
+
+# Set to 1 for debug printing, 0 otherwise.
+my $DEBUG = 0;
+
+# used with the alarm signal, times out packet requests
+my $ALARMTIMEOUT = 15;
+
+# maximum number of bytes to read in the packet
+my $MAXLEN = 8192;
+
+##########################################################################
+#
+##########################################################################
+
+sub ExtractPKHTotalFlowAndPower {
+
+  my ( $socket, $UDPPacket, $IPAddress, $portAddressSend, %results, );
+
+  # Debug messages.
+  if ( $DEBUG ) {
+    print "Extracting WaterView data\n";
+    print "REMOTEHOST is $REMOTEHOST\n";
+    print "REMOREPORT is $REMOREPORT\n";
+  } # end if
+
+  #  Preform the nessesary preperations to send and receive packets
+  $IPAddress = inet_aton( $REMOTEHOST) or die "Error in inet_aton\n";
+  $portAddressSend = sockaddr_in($REMOREPORT, $IPAddress);
+
+  # create one socket for each location
+  $socket = openConnection();
+  if( $socket) {
+
+    print "get upd data. . .\n" if($DEBUG);
+
+    $UDPPacket = getPacket( $socket, "WVTVA\0", $portAddressSend);
+
+    print "parse upd data. . .\n" if($DEBUG);
+
+    parsePacket( $UDPPacket, \%results);
+
+    if ( $DEBUG ) {
+      print "$UDPPacket\n";
+      print "PKH DateTime is $results{PKH}{DATETIME}\n";
+      print "PKH Date is $results{PKH}{DATE}\n";
+      print "PKH Time is $results{PKH}{TIME}\n";
+      print "PKH TURBINE FLOW is $results{PKH}{TURBINE}\n";
+      print "PKH POWER is $results{PKH}{POWER}\n";
+    } # end if
+
+  }
+  close( $socket); # end if
+   
+  # Destroy the socket object.
+  undef $socket;
+
+  # Create the temporary output file.
+  open( FH, ">$TmpDataFile" );
+  print FH "#Date, Time, TotalPlantFlow, TotalPlantPower\n";
+  printf FH "%s, ", $results{PKH}{DATE};
+  printf FH "%s, ", $results{PKH}{TIME};
+  printf FH "%.1f, %.1f\n", $results{PKH}{TURBINE}, $results{PKH}{POWER};
+  close FH;
+
+} # end ExtractPKHTotalFlowAndPower
+
+##########################################################################
+#
+##########################################################################
+
+sub parsePacket {
+
+  my ( $data, $results) = @_;
+
+  my ( @lines, 
+       $wvCode, $headWater, $tailWater, $turbine, $spill, 
+       $power, $datetime, $date, $time,
+     );
+
+  print "Parsing WaterView data packet\n" if ( $DEBUG );
+
+  @lines = split("\n", $data);
+
+  foreach my $line ( @lines) {
+
+    # 0        1          2      3      4      5           6           7
+    ( $wvCode, $datetime, undef, undef, undef, $headWater, $tailWater, undef,
+    #   8      9       10     11        12
+        undef, $power, undef, $turbine, undef) = split(",", $line);
+
+    # Only extract data from line with a valid reservoir code.
+    if ( length($wvCode) == 3 ) {
+
+      ($date, $time) = split(" ", $datetime);
+      $results->{$wvCode} = {
+          DATETIME => $datetime,
+          DATE     => $date,
+          TIME     => $time,
+          TURBINE  => $turbine,
+          POWER    => $power,
+                       };
+    }
+  }
+} # end parsePacket
+
+##########################################################################
+#
+##########################################################################
+
+sub openConnection {
+
+  my ( $tempSocket, );
+
+  # make SOCKET local so you get new handles each time you are called
+  local *SOCKET;
+
+  unless( socket( SOCKET, PF_INET, SOCK_DGRAM, getprotobyname("udp"))) {
+    print "could not create socket connection!!!\n";
+    return undef;
+  }
+
+  $tempSocket = *SOCKET;
+
+  # return the new socket
+  return $tempSocket;
+
+} # end openConnection
+
+##########################################################################
+#
+##########################################################################
+
+sub getPacket {
+
+  my ( $socket, $requestStr, $portAddressSend) = @_;
+
+  my ( $portAddressRecv, $UDPPacket);
+
+  send( $socket, $requestStr, 0, $portAddressSend);
+
+  # wait to recieve a response, if it takes to long then time out with alarm
+  eval { 
+    alarm $ALARMTIMEOUT;
+    $portAddressRecv = recv( $socket, $UDPPacket, $MAXLEN, 0);
+    alarm 0;
+  };
+
+  return $UDPPacket;
+
+} # end getPacket
+
+###############################################################################
+#
+###############################################################################
+
+sub SftpDataFile {
+
+  my ( $CommandString, $Msg,
+     );
+
+  print "Sending file to remote server\n" if ( $DEBUG );
+
+  # Make sure the temporary file exists.
+  unless ( -e $TmpDataFile ) {
+
+    # Send error email
+    $Msg = "In script $SCRIPTNAME, the temporary file $TmpDataFile " .
+           "could not be found";
+    EmailErrorMessage( $Msg );
+    return;
+
+  }
+
+  print "scp'ing file to $SECUREHOSTNAME\n" if ( $DEBUG );
+
+  # Build the command string to scp the file.
+  $CommandString = "sftp -b $SFTPBATCHFILE $SECUREUSERNAME\@$SECUREHOSTNAME";
+  system( $CommandString );
+  print "CommandString is $CommandString\n" if ( $DEBUG );
+
+  return;
+
+} # end SftpDataFile
+
+###############################################################################
+#
+#
+###############################################################################
+
+sub GetHostInfo {
+
+  my ( $SearchString, $Line1Ref, $Line2Ref ) = @_;
+
+  my ( @Array,
+       $InputLine, $Index,
+     );
+
+  # Define the location of the hosts info file.
+  my $HostInfoFile = "/apps/rfc/system/data/hosts.connect";
+
+  # Make sure the host info file exists.
+    if ( -e $HostInfoFile ) {
+
+    # open the file
+    open( FILE, "<$HostInfoFile" ) or die "$!";
+
+    # Initialize loop variables.
+    $Index = 0;
+    $Array[1] = "";
+    $Array[2] = "";
+
+    # Read each line of the hosts info file.
+    while ( $InputLine = <FILE> ) {
+
+      # Return any carriage returns.
+      chomp $InputLine;
+
+      # Skip commented lines
+      next if ( $InputLine =~ m/^#/gi );
+
+      # Has the search string already been found?
+      if ( $Index == 1 ) {
+        # Save the first line after the search tag.
+        $Array[$Index++] = $InputLine;
+
+      } elsif ( $Index == 2 ) {
+        # Save the second line after the search tag and exit the loop.
+        $Array[$Index] = $InputLine;
+        last;
+
+      } else {
+        # Is the current line the search tag?
+        if ( $InputLine =~ m/^<$SearchString>$/ ) {
+          $Index = 1;
+        }
+
+      }
+
+    }
+    close( FILE );
+
+    # Assign the array values to the references passed in.
+    $$Line1Ref = $Array[1];
+    $$Line2Ref = $Array[2];
+
+  } else {
+
+    # Connection file not found.
+    die "Connection file $HostInfoFile not found!! Aborting script...\n";
+    exit;
+
+  }
+
+} # end GetHostInfo
+
+
+###############################################################################
+#
+#
+###############################################################################
+
+sub EmailErrorMessage {
+
+  my ( $MessageText ) = @_;
+
+  # Send the message text to the requested address.
+  open( MAIL, "|/bin/mail $ERROREMAILADDRESS >> /dev/null" );
+  print MAIL << "EOF";
+To: $ERROREMAILADDRESS
+Subject: Error in Script $SCRIPTNAME
+
+$MessageText
+EOF
+
+  close MAIL;
+
+  return;
+
+} # end EmailErrorMessage
+
+
+###############################################################################
+#
+# main
+#
+###############################################################################
+
+sub MainProcedure {
+
+  # Use WaterView server to determine Pickwick total plant flow and power.
+  ExtractPKHTotalFlowAndPower();
+
+  # Send the data to the remote server.
+  SftpDataFile();
+
+#  # After transfer is complete, delete the temporary file.
+#  unlink $TmpDataFile;
+
+  exit;
+
+} # end main
+
+###############################################################################
+#
+###############################################################################
+
+MainProcedure();

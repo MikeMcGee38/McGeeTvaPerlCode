@@ -1,0 +1,327 @@
+#!/usr/bin/perl
+#=========================================================================
+#
+# File: /apps/rfc/system/bin/ProcessCorpWebPages
+#
+# Purpose: Process US Corp of Engineers web pages to extract head water,
+#          tail water, turbine flow, total flow and generation data
+#          for Corp dams in the Cumberland River system.  The data
+#          is merged into a single CSV file, transferred to the 
+#          appropriate FS1 server and a workflow is run to ingest
+#          the data.
+#
+# Inputs:  Corp web pages for select plants.
+#          Python script to execute two FEWS workflows.
+#
+# Outputs: A single CSV file that is transferred to the FS1 server.
+#          Log file for status messages.
+#
+# Developer: Mike McGee
+#
+# Updates:
+# Contacts:
+#  1.0  09/09/2015  mpm  original code
+#  2.0  02/16/2016  mpm  switch to sftp to transfer files to FS1
+#  2.1  04/14/2016  mpm  execute FEWS workflow after transferring files
+#  2.2  05/03/2016  mpm  read database name from DetermineEnvironment app.
+#  2.3  06/14/2016  mpm  execute python script to run FEWS workflow
+#  3.0  03/29/2017  mpm  convert from sftp to smbclient for file xfers
+#                          to FEWS.
+#  3.1  05/12/2017  kar  changed name of local temp file 
+#
+#=========================================================================
+
+use lib '/apps/rfc/system/lib';
+
+# Specify perl modules to load.
+use TvaGeneralRoutines;
+use UserIdsWithEncryption;
+use Date::Calc qw(:all);
+
+use strict;
+
+# Determine the process ID of the script.
+my $PROCESSID = $$;
+
+# Determine operating environment.
+my $TempString = `/apps/rfc/system/bin/DetermineEnvironment`;
+my ( $SERVERTYPE, $FORECASTSHELLSERVER, $DBNAME ) = split /,/, $TempString;
+
+# Define the smbclient variables.
+my $SMBUSERID;
+my $SMBUSERPASSWD;
+my $SMBWORKGROUP;
+GetKeyInfo( "FS1_$SERVERTYPE", \$SMBUSERID, \$SMBUSERPASSWD, \$SMBWORKGROUP );
+my $SMBCLIENTPROGRAM = "/usr/bin/smbclient";
+
+# Declare server directory where files will be copied.
+my $FEWSREMOTEDIR = "data/$DBNAME/Import/USACE";
+
+# Define the work flow command to be run when new data is transferred.
+my $WORKFLOWCOMMAND = "/apps/rfc/system/bin/execute_workflow_linux.py " .
+                      "-workflow=ImportCorps";
+
+# Define the server dependent globals
+my $WEBSERVER    = "www.lrn-wc.usace.army.mil";
+my $WEBDIRECTORY = "reports";
+my $LOGFILENAME  = "/apps/rfc/system/logs/ProcessCorpWebPages.log";
+
+# Build the hash with information for each Corp dam.  The hash array contains:
+#  Index 0 - Dam name
+#  Index 1 - URL for data
+#  Index 2 - Column with head water value
+#  Index 3 - Column with tail water value
+#  Index 4 - Column with turbine flow
+#  Index 5 - Column with total flow
+#  Index 6 - Column with generation in MW
+my %WEBSITESINFO = ( '34' => [ 'Wolf Creek',     '48WOL.rpt', 3, 5, 7, 11, 12 ],
+                     '35' => [ 'Dale Hallow',    '48DAL.rpt', 3, 5, 7, 10, 11 ],
+                     '37' => [ 'Center Hill',    '48CEN.rpt', 3, 5, 7, 11, 12 ],
+                     '38' => [ 'Old Hickory',    '48OLD.rpt', 3, 5, 7,  9, 10 ],
+                     '39' => [ 'Cheatham',       '48CHE.rpt', 3, 5, 7,  9, 10 ],
+                     '40' => [ 'Barkley',        '48BAR.rpt', 3, 5, 7,  9, 10 ],
+                     '47' => [ 'Cordell Hull',   '48COR.rpt', 3, 5, 7,  9, 10 ],
+                     '48' => [ 'J Percy Priest', '48JPP.rpt', 3, 5, 7, 10, 11 ],
+               );
+
+# Define the directory for temporary files.
+my $LOCALTEMPDIR      = "/tmp/usace_webdata";
+# my $LOCALTEMPFILENAME = "RFC_CumberlandProjectsObserved_USACE_";
+# KAR -- 05/12/17 Changed filename
+my $LOCALTEMPFILENAME = "COERR1LRN_backup_"; 
+my $TEMPFILEPREFIX    = "CorpData";
+my $LOCALCSVFILENAME;
+
+###############################################################################
+#
+# Verify that the temporary data file directory exists and is empty.
+#
+###############################################################################
+
+sub VerifyTempDirectory {
+
+  my ( $Command, $Status,
+     );
+
+  # If the local directory does not exist, create it.
+  unless ( -e $LOCALTEMPDIR) {
+    mkdir $LOCALTEMPDIR;
+    chmod 0777, $LOCALTEMPDIR;
+  }
+
+  # Delete any files off the local directory.
+  $Command = "rm -f $LOCALTEMPDIR/*";
+  $Status = `$Command`;
+
+} # end VerifyTempDirectory
+
+########################################################################
+#
+# Collect data from the various Corp web sites for data.
+#
+########################################################################
+
+sub CollectWebSiteData {
+
+  my ( $WebSiteURL, $Status, $Command,
+     );
+
+  # Search for the web site for each Corp dam.
+  foreach my $ResID ( keys %WEBSITESINFO ) {
+
+    # Determine the URL for the current Corp dam.
+    $WebSiteURL = "http://" . $WEBSERVER . "/" . $WEBDIRECTORY . "/" .
+                  $WEBSITESINFO{$ResID}[1];
+
+    $Command= "/usr/bin/wget -O $LOCALTEMPDIR/" .
+              "$TEMPFILEPREFIX$ResID.tmp " . "$WebSiteURL";
+
+    # Execute the wget command.
+    $Status = `$Command 2>/dev/null`;
+
+  } # end foreach
+  
+  return;
+
+} # End CollectWebSiteData
+
+########################################################################
+#
+# Process the data files with web data.
+#
+########################################################################
+
+sub ProcessCollectedData {
+
+  my ( @LineValues,
+       $TempFilename, $DamName, $DateString, $TimeString,
+       $HeadWaterElev, $TailWaterElev, $TurbineFlow, $TotalFlow, $Gen,
+       $Year, $Month, $Day, $Hour,
+     );
+
+  # Build the name of the temporary output file.
+  $DateString = CurrentTVADateTime( 5 );
+  $LOCALCSVFILENAME = "$LOCALTEMPFILENAME$DateString.csv";
+
+  # Open the output file and write the header line.
+  open( FH1, ">$LOCALTEMPDIR/$LOCALCSVFILENAME" );
+  print FH1 "PlantId, Date Time, HeadElev, TailElev, TurbDisch, " .
+            "TotDisch, GenMWH\n";
+
+  # Process each data file.
+  foreach my $ResID ( keys %WEBSITESINFO ) {
+
+    # Build the name of the temporary file.
+    $TempFilename= "$LOCALTEMPDIR/$TEMPFILEPREFIX$ResID.tmp";
+
+    # Determine the name of the current dam.
+    $DamName = $WEBSITESINFO{$ResID}[0];
+
+    # Open the file for input.
+    open( FH2, "$TempFilename" );
+
+    # Process each line in the file.
+    while ( my $Line = <FH2> ) {
+
+      # Remove the carriage return.
+      chomp $Line;
+
+      # Split the line by spaces.
+      @LineValues = split( " ", $Line );
+
+      # Skip lines that don't start with a date string.
+      next unless ( $LineValues[0] =~ /^(\d+)\/(\d+)\/(\d+)/ );
+
+      # Extract the needed values from the line.
+      $DateString    = $LineValues[0];
+      $TimeString    = $LineValues[1];
+      $HeadWaterElev = $LineValues[$WEBSITESINFO{$ResID}[2] -1];
+      $TailWaterElev = $LineValues[$WEBSITESINFO{$ResID}[3] -1];
+      $TurbineFlow   = $LineValues[$WEBSITESINFO{$ResID}[4] -1];
+      $TotalFlow     = $LineValues[$WEBSITESINFO{$ResID}[5] -1];
+      $Gen           = $LineValues[$WEBSITESINFO{$ResID}[6] -1];
+
+      # Ignore the line if any of the values are ------.
+      if ( $HeadWaterElev =~ /--/ || $TailWaterElev =~ /--/ ||
+           $TurbineFlow =~ /--/ || $TotalFlow =~ /--/ ||
+           $Gen =~ /--/ ) {
+
+        # At least one missing value in line.  Ignore this line.
+        next;
+
+      } # end if
+
+      # If present, remove the plus character from the generation value.
+      $Gen =~ s/\+//;
+
+      # Reformat the time string into HH:00.
+      $Hour = substr( $TimeString, 0, 2 );
+      $TimeString = sprintf( "%02d:00", $Hour );
+
+      # Save the current data to the output file.
+      print FH1 "$ResID, $DateString $TimeString, $HeadWaterElev, " .
+                "$TailWaterElev, $TurbineFlow, $TotalFlow, $Gen\n";
+
+    } # end while
+
+    # Close the current input file.
+    close FH2;
+
+  } # end foreach
+  
+  # Close the output file.
+  close FH1;
+
+  return;
+
+} # End ProcessCollectedData
+
+########################################################################
+#
+########################################################################
+
+sub CopyFileToFEWS {
+
+  my ( $FewsServiceName, $CommandString, $Status,
+     );
+
+  # Determine the samba service name for the FEWS FS1 server.
+  # All environments are the same except DEV.
+  $FewsServiceName = "$FORECASTSHELLSERVER/Fews";
+  if ( $SERVERTYPE =~ "DEV" ) {
+    $FewsServiceName .= "_DEV";
+  } # end if
+
+  # Build the samba command to copy the file to FEWS.
+  $CommandString = "$SMBCLIENTPROGRAM //$FewsServiceName " .
+                   "-W $SMBWORKGROUP -U $SMBUSERID%$SMBUSERPASSWD " .
+                   "-c \"cd $FEWSREMOTEDIR; lcd $LOCALTEMPDIR; " .
+                   "put $LOCALCSVFILENAME\"";
+  $Status = `$CommandString`;
+
+  return;
+
+} # End CopyFileToFEWS
+
+########################################################################
+#
+########################################################################
+
+sub LogEntry {
+
+  my ( $Message ) = @_;
+
+  my ( $DateTimeString,
+     );
+
+  # Open the log file for writing.
+  open( LFH, ">>$LOGFILENAME" );
+
+  # Determine the date/time and save the message to the log file.
+  $DateTimeString = CurrentTVADateTime( 5 );
+  print LFH "$DateTimeString - $Message\n";
+
+  # Close the log file.
+  close LFH;
+
+  return;
+
+} # End LogEntry
+
+########################################################################
+# 
+########################################################################
+
+sub Main {
+
+  my ( $CommandString, $Status,
+     );
+
+  # Verify the temp directory exists.
+  VerifyTempDirectory();
+
+  # Collect data from the Corp web sites.
+  CollectWebSiteData();
+
+  # Process the data collected.
+  ProcessCollectedData();
+
+  # Copy the data file to the FEWS FS server.
+  CopyFileToFEWS();
+
+  # Execute the FEWS workflow to import the files.
+  $Status = `$WORKFLOWCOMMAND`;
+
+  # Save a log message with the number of inserted and updated records.
+  LogEntry( "All web sites for Corp dams processed" );
+
+  return;
+
+} # End Main
+
+########################################################################
+# 
+########################################################################
+
+# Call the Main routine.
+Main();
